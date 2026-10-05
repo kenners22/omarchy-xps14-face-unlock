@@ -1,0 +1,672 @@
+# Adds a Howdy IR face-auth path to the Omarchy lock plugin, alongside the
+# built-in password and fingerprint PAM flows. When the lock comes up after
+# 20 s without input (idle timeout) or on resume, the scan starts at once.
+# When locked while active (Super+Ctrl+L), it waits for a key or trackpad
+# press, so locking at the desk does not unlock straight away.
+#
+# It also makes the lock screen look like Omarchy's boot unlock screen instead
+# of the blurred wallpaper, and follow whichever style you pick in Omarchy's
+# menu under Style > Unlock (Default or any theme's): the same logo, padlock,
+# background and text colour, re-read on every lock. Pixel-art logos are drawn
+# at exactly 2x with smoothing off, so they stay sharp on HiDPI screens.
+#
+# Made against Omarchy 4.0.4's lock plugin (checksums in lock/UPSTREAM_SHA256).
+# Apply to a clone, never to /usr/share/omarchy:
+#
+#   omarchy plugin clone omarchy.lock          # creates ~/.config/omarchy/plugins/$USER.lock
+#   cd ~/.config/omarchy/plugins/$USER.lock && patch -p1 < face-lock.patch
+#   omarchy restart shell
+#
+--- a/LockView.qml
++++ b/LockView.qml
+@@ -1,5 +1,6 @@
+ import QtQuick
+ import QtQuick.Effects
++import QtQuick.Window
+ import qs.Commons
+ import qs.Ui
+ 
+@@ -9,6 +10,8 @@
+   property string backgroundPath: ""
+   property int backgroundVersion: 0
+   property bool fingerprintConfigured: false
++  property bool faceConfigured: false
++  property bool faceAuthenticating: false
+   property bool authenticatingPassword: false
+   property string failureMessage: ""
+   property int failedAttempts: 0
+@@ -18,8 +21,27 @@
+   property bool syncingPasswordText: false
+ 
+   readonly property string placeholderText: "Enter Password"
+-  readonly property int fieldWidth: 381
+-  readonly property int fieldHeight: 67
++  // Mirrors Omarchy's boot unlock screen (the Plymouth theme), whose style is
++  // picked under Style > Unlock in the Omarchy menu: its logo and padlock, background
++  // and text colour, the field 40 below the logo and the padlock 15 to its
++  // left. Without them it falls back to the default logo and shell colours.
++  property string unlockStyleDir: ""
++  property string defaultLogoPath: ""
++  property string styleBackground: ""
++  property string styleText: ""
++  readonly property color backgroundColor: styleBackground || Color.background
++  readonly property color textColor: styleText || Color.lock.text
++  readonly property color placeholderColor: styleText ? Qt.alpha(styleText, 0.66) : Color.lock.placeholder
++  // Never wider than 800, nor than most of a narrow (e.g. portrait) screen.
++  readonly property int maxLogoWidth: Math.min(800, Math.floor(width * 0.85))
++  // The logo is centred, so its lower half plus the field and margins must fit
++  // in the lower half of the screen.
++  readonly property int maxLogoHeight: Math.max(40, Math.floor(height - 2 * (40 + fieldHeight + 24)))
++  // On a 1.25x/1.5x screen logo pixels cannot land on whole screen pixels, so
++  // smoothing beats uneven nearest-neighbour blocks there.
++  readonly property bool fractionalScale: Screen.devicePixelRatio % 1 !== 0
++  readonly property int fieldWidth: 286
++  readonly property int fieldHeight: 48
+   readonly property int outlineThickness: 3
+   readonly property int fieldFontSize: Math.round(Style.font.heading * 1.125)
+   readonly property int passwordDotFontSize: Math.round(Style.font.heading * 1.33)
+@@ -27,6 +49,9 @@
+   // Space to keep clear on each side of the field for the fingerprint icon
+   // (icon width plus a gap) so the centered dots never run under it.
+   readonly property real fingerprintReserve: fingerprintConfigured ? Math.round(fingerprintIcon.implicitWidth + 12) : 0
++  // The face hint takes the opposite edge, and is reserved on both sides the
++  // same way, so the two hints together still leave the dots centered.
++  readonly property real faceReserve: faceConfigured ? Math.round(faceIcon.implicitWidth + 12) : 0
+   // Shrink the dots to fit once the password outgrows the field, so every
+   // keystroke stays visible — otherwise long passwords clip with no feedback.
+   readonly property real passwordDotScale: dotMetrics.advanceWidth > 0
+@@ -36,12 +61,20 @@
+   readonly property bool errorState: failureMessage.length > 0
+   readonly property var inputBorderSpec: errorState
+     ? Border.surfaceSpec("lock", "border-error", Color.lock.borderError, root.outlineThickness, "border-alpha")
+-    : Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha")
++    : styleBorderSpec(Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha"))
++
++  // The boot screen draws its field outline in the style's text colour.
++  function styleBorderSpec(spec) {
++    if (!styleText) return spec
++    return { color: textColor, widths: spec.widths, gradient: null }
++  }
+ 
+   signal submitPassword(string password)
+   signal passwordTextEdited(string password)
+   signal clearFailureRequested()
+-  signal wakeRequested()
++  // pointerOnly: plain pointer movement, which the lock surface appearing
++  // under the cursor can fake; keys, clicks and taps pass false.
++  signal wakeRequested(bool pointerOnly)
+ 
+   // Cache-busts the lock background by appending `?v=`. Adding a query
+   // string keeps Image's loader happy while forcing it to reload when the
+@@ -88,43 +121,65 @@
+ 
+   Rectangle {
+     anchors.fill: parent
+-    color: Color.background
++    color: root.backgroundColor
+ 
++    // Most unlock logos are pixel art, 800 wide. At their own size on a 1x or
++    // 2x screen they land on whole screen pixels, so smoothing stays off and
++    // every edge stays sharp; a logo shrunk to fit, or on a fractional scale,
++    // gets smoothed.
+     Image {
+-      id: wallpaper
+-      anchors.fill: parent
+-      source: root.loadBackground ? root.fileUrl(root.backgroundPath) : ""
+-      fillMode: Image.PreserveAspectCrop
+-      asynchronous: true
++      id: logo
++      property bool useDefault: false
++      readonly property real fit: implicitWidth > 0 && implicitHeight > 0
++        ? Math.min(1, root.maxLogoWidth / implicitWidth, root.maxLogoHeight / implicitHeight)
++        : 1
++      readonly property bool shrunk: fit < 1
++      source: root.fileUrl(useDefault || !root.unlockStyleDir ? root.defaultLogoPath : root.unlockStyleDir + "/logo.png")
+       cache: false
+-      sourceSize.width: width
+-      sourceSize.height: height
++      anchors.centerIn: parent
++      width: Math.round(implicitWidth * fit)
++      height: Math.round(implicitHeight * fit)
++      fillMode: Image.PreserveAspectFit
++      smooth: shrunk || root.fractionalScale
++      mipmap: shrunk
++      onStatusChanged: if (status === Image.Error && !useDefault) useDefault = true
++      Connections {
++        target: root
++        function onUnlockStyleDirChanged() { logo.useDefault = false }
++        function onBackgroundVersionChanged() { logo.useDefault = false }
++      }
+     }
+ 
+-    MultiEffect {
+-      anchors.fill: wallpaper
+-      source: wallpaper
+-      autoPaddingEnabled: false
+-      blurEnabled: root.loadBackground && wallpaper.status === Image.Ready
+-      blur: 1.0
+-      blurMax: 128
+-      blurMultiplier: 1.25
+-      contrast: -0.08
++    // The boot screen's padlock, already recoloured to the style's text colour.
++    Image {
++      id: padlock
++      source: root.unlockStyleDir ? root.fileUrl(root.unlockStyleDir + "/lock.png") : ""
++      cache: false
++      height: Math.round(root.fieldHeight * 0.8)
++      width: Math.round(height * 84 / 96)
++      sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
++      anchors.right: inputField.left
++      anchors.rightMargin: 15
++      anchors.verticalCenter: inputField.verticalCenter
++      smooth: true
++      mipmap: true
+     }
+ 
+     MouseArea {
+       anchors.fill: parent
+       hoverEnabled: true
+-      onClicked: { root.wakeRequested(); root.forcePasswordFocus() }
+-      onPositionChanged: root.wakeRequested()
++      onClicked: { root.wakeRequested(false); root.forcePasswordFocus() }
++      onPositionChanged: root.wakeRequested(true)
+     }
+ 
+     BorderSurface {
+       id: inputField
+       width: root.fieldWidth
+       height: root.fieldHeight
+-      anchors.centerIn: parent
+-      color: Color.lock.background
++      anchors.horizontalCenter: parent.horizontalCenter
++      anchors.top: logo.bottom
++      anchors.topMargin: 40
++      color: root.backgroundColor
+       borderSpec: root.inputBorderSpec
+       radius: Style.cornerRadius
+       clip: true
+@@ -133,11 +188,11 @@
+         id: passwordInput
+         anchors.fill: parent
+         anchors.topMargin: inputField.borderTop
+-        // Reserve the fingerprint icon's width on both sides so the centered
+-        // dots stay symmetric and never slide under the icon as they grow.
+-        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve
++        // Reserve the hint icons' width on both sides so the centered dots stay
++        // symmetric and never slide under an icon as they grow.
++        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve + root.faceReserve
+         anchors.bottomMargin: inputField.borderBottom
+-        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve
++        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve + root.faceReserve
+         verticalAlignment: TextInput.AlignVCenter
+         horizontalAlignment: TextInput.AlignHCenter
+         activeFocusOnPress: true
+@@ -147,7 +202,7 @@
+         echoMode: TextInput.Password
+         passwordCharacter: "\u25CF"
+         passwordMaskDelay: 0
+-        color: Color.lock.text
++        color: root.textColor
+         selectionColor: Color.lock.selection
+         selectedTextColor: Color.lock.text
+         font.family: Style.font.family
+@@ -156,14 +211,14 @@
+         cursorVisible: activeFocus && root.showPasswordCursor && text.length > 0
+         cursorDelegate: Rectangle {
+           width: 2
+-          color: Color.lock.text
++          color: root.textColor
+           visible: passwordInput.cursorVisible
+         }
+ 
+         onTextChanged: {
+           if (!root.syncingPasswordText) root.passwordTextEdited(text)
+           if (text.length > 0) {
+-            root.wakeRequested()
++            root.wakeRequested(false)
+           }
+           if (text.length > 0 && root.failureMessage.length > 0) root.clearFailureRequested()
+         }
+@@ -175,7 +230,7 @@
+         }
+ 
+         Keys.onPressed: function(event) {
+-          root.wakeRequested()
++          root.wakeRequested(false)
+           if (event.key === Qt.Key_Escape || (event.modifiers & Qt.ControlModifier && event.key === Qt.Key_U)) {
+             root.passwordTextEdited("")
+             event.accepted = true
+@@ -188,7 +243,7 @@
+         anchors.fill: passwordInput
+         text: root.authenticatingPassword ? "Checking…" : (root.failureMessage.length > 0 ? root.failureMessage : root.placeholderText)
+         visible: passwordInput.text.length === 0
+-        color: root.authenticatingPassword ? Color.lock.text : (root.failureMessage.length > 0 ? Color.lock.textError : Color.lock.placeholder)
++        color: root.authenticatingPassword ? root.textColor : (root.failureMessage.length > 0 ? Color.lock.textError : root.placeholderColor)
+         font.family: Style.font.family
+         font.pixelSize: root.fieldFontSize
+         font.italic: !root.authenticatingPassword && root.failureMessage.length > 0
+@@ -208,7 +263,28 @@
+         anchors.verticalCenter: parent.verticalCenter
+         visible: root.fingerprintConfigured
+         text: "󰈷"
+-        color: Color.lock.placeholder
++        color: root.placeholderColor
++        font.family: Style.font.family
++        font.pixelSize: Math.round(root.fieldFontSize * 1.1)
++        horizontalAlignment: Text.AlignHCenter
++        verticalAlignment: Text.AlignVCenter
++      }
++
++      // Face hint on the field's opposite edge when a face is enrolled. It
++      // brightens only while the camera is actually looking: the fingerprint
++      // reader stays armed for the whole lock, so a steady icon tells the truth
++      // there, but the face scan rests between bursts and a steady icon would
++      // promise a camera that is not on.
++      Text {
++        id: faceIcon
++        objectName: "faceIndicator"
++        anchors.left: parent.left
++        anchors.leftMargin: inputField.borderLeft + 18
++        anchors.verticalCenter: parent.verticalCenter
++        visible: root.faceConfigured
++        opacity: root.faceAuthenticating ? 1 : 0.5
++        text: "󰱻"
++        color: root.placeholderColor
+         font.family: Style.font.family
+         font.pixelSize: Math.round(root.fieldFontSize * 1.1)
+         horizontalAlignment: Text.AlignHCenter
+--- a/Service.qml
++++ b/Service.qml
+@@ -15,13 +15,39 @@
+   readonly property string stateHome: home + "/.local/state"
+   readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME")
+   readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
++  // The unlock style picked under Style > Unlock in the Omarchy menu
++  // (omarchy-plymouth-set-by-theme / omarchy-plymouth-reset) is installed
++  // here; the lock screen mirrors it.
++  readonly property string unlockStyleDir: "/usr/share/plymouth/themes/omarchy"
++  readonly property string defaultUnlockLogo: (omarchyPath || "/usr/share/omarchy") + "/default/plymouth/logo.png"
++  property string unlockBackground: ""
++  property string unlockText: ""
++  // Starting the face PAM runs the IR camera for real -- emitter on, a few
++  // seconds of capture, then a timeout -- so it gets a small burst of tries and
++  // then rests, rather than the fingerprint reader's open-ended retry loop.
++  readonly property int faceAttemptBudget: 3
++  // When the lock comes up while someone is at the keyboard (Super+Ctrl+L, the
++  // menu), the camera would see the very face that just locked it, so the scan
++  // waits for someone to wake the lock: a key or a trackpad press starts it at
++  // once. Plain pointer movement only counts after this grace, because the lock
++  // surface appearing under the cursor can look like movement.
++  readonly property int faceWakeGraceMs: 1500
++  // No input for this long before the lock (idle timeout, or the screen locking
++  // on someone who was just reading) means nobody locked it on purpose: scan
++  // straight away, so the face is already being looked for. Same after resume.
++  readonly property int faceAwaySeconds: 20
+ 
+   property bool lockRequested: false
+   property bool pendingSessionLock: false
+   property bool authenticatingPassword: false
+   property bool fingerprintAuthenticating: false
++  property bool faceAuthenticating: false
+   property bool passwordPamConfigured: false
+   property bool fingerprintConfigured: false
++  property bool faceConfigured: false
++  property int faceAttempts: 0
++  property bool faceWaitingForWake: false
++  property double lockStartedAt: 0
+   property bool previewVisible: false
+   property string enteredPassword: ""
+   property string pendingPassword: ""
+@@ -33,9 +59,10 @@
+   property string lastEventAt: ""
+   property bool strandedLock: false
+   property bool strandedLockResolved: false
++  property bool displayBlanked: false
+ 
+   readonly property bool locked: lockRequested || sessionLock.locked || sessionLock.secure
+-  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating
++  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating || faceAuthenticating
+ 
+   function realScreenCount() {
+     var screens = Quickshell.screens || []
+@@ -100,13 +127,21 @@
+   }
+ 
+   function refreshBackground() {
++    // The theme's unlock.png keeps one path across theme switches, so reload
++    // the logo on every lock rather than only when the background path changes.
++    backgroundVersion += 1
+     if (!readlinkProc.running) readlinkProc.running = true
++    if (!unlockStyleProc.running) unlockStyleProc.running = true
+   }
+ 
+   function refreshFingerprintStatus() {
+     if (!fingerprintCheckProc.running) fingerprintCheckProc.running = true
+   }
+ 
++  function refreshFaceStatus() {
++    if (!faceCheckProc.running) faceCheckProc.running = true
++  }
++
+   function logEvent(event) {
+     lastEvent = event
+     lastEventAt = new Date().toISOString()
+@@ -120,9 +155,14 @@
+     failedAttempts = 0
+     authenticatingPassword = false
+     fingerprintAuthenticating = false
++    faceAuthenticating = false
++    faceAttempts = 0
++    faceWaitingForWake = false
+     fingerprintRetryTimer.stop()
++    faceRetryTimer.stop()
+     if (passwordPam.active) passwordPam.abort()
+     if (fingerprintPam.active) fingerprintPam.abort()
++    if (facePam.active) facePam.abort()
+   }
+ 
+   function beginLock() {
+@@ -133,6 +173,9 @@
+ 
+     resetAuthenticationState()
+     lockRequested = true
++    faceWaitingForWake = !awayMonitor.isIdle
++    lockStartedAt = Date.now()
++    logEvent(faceWaitingForWake ? "face: wait for wake (locked while active)" : "face: scan now (locked while away)")
+     armBlankTimer()
+     logEvent("lock-requested")
+     queueSessionLock()
+@@ -140,6 +183,7 @@
+     Qt.callLater(function() {
+       root.refreshBackground()
+       root.refreshFingerprintStatus()
++      root.refreshFaceStatus()
+     })
+ 
+     return true
+@@ -164,12 +208,23 @@
+     idleBlankTimer.restart()
+   }
+ 
+-  function runWake() {
++  function runWake(pointerOnly) {
++    // A blanked panel coming back is the one signal the lock has that someone
++    // is in front of it again, so it is where the face scan earns another
++    // burst. Every wake source feeds through here -- key press, pointer, the
++    // click that focuses the field -- and the blanked edge keeps a drifting
++    // mouse from restarting the camera on every frame.
++    var wasBlanked = displayBlanked
++    displayBlanked = false
++
+     if (!wakeProcess.running) wakeProcess.running = true
+     if (lockRequested) armBlankTimer()
++    var firstWake = faceWaitingForWake && (!pointerOnly || Date.now() - lockStartedAt >= faceWakeGraceMs)
++    if (wasBlanked || firstWake) rearmFace()
+   }
+ 
+   function runBlank() {
++    displayBlanked = true
+     if (!blankProcess.running) blankProcess.running = true
+   }
+ 
+@@ -177,10 +232,13 @@
+     var password = String(value || "")
+     if (!lockRequested || authenticatingPassword || password.length === 0) return
+ 
+-    runWake()
++    // Mark the check as running before waking, so the wake cannot start a face
++    // scan alongside it (a password stack that also runs Howdy would then
++    // fight the face scan for the camera).
+     pendingPassword = password
+     failureMessage = ""
+     authenticatingPassword = true
++    runWake()
+ 
+     if (!passwordPam.start()) {
+       handlePasswordFailure()
+@@ -204,6 +262,8 @@
+     failedAttempts += 1
+     failureMessage = "Authentication failed (" + failedAttempts + ")"
+     runWake()
++    // Face tries held back during the check pick up where they left off.
++    if (faceConfigured && !faceWaitingForWake && faceAttempts < faceAttemptBudget) faceRetryTimer.restart()
+   }
+ 
+   function startFingerprint() {
+@@ -227,6 +287,42 @@
+     }
+   }
+ 
++  function startFace() {
++    if (!lockRequested || !sessionLock.secure || !faceConfigured) return
++    if (faceWaitingForWake || authenticatingPassword) return
++    if (facePam.active || faceAuthenticating) return
++    if (faceAttempts >= faceAttemptBudget) return
++
++    faceAttempts += 1
++    faceAuthenticating = true
++    if (!facePam.start()) {
++      faceAuthenticating = false
++    }
++  }
++
++  function handleFaceFinished(result) {
++    faceAuthenticating = false
++
++    if (!lockRequested) return
++    if (result === PamResult.Success) {
++      finishUnlock()
++    } else if (faceConfigured && faceAttempts < faceAttemptBudget) {
++      faceRetryTimer.restart()
++    }
++  }
++
++  // Hands the camera a fresh budget once the opening burst has run out. A
++  // password check in flight already owns the unlock, so it is left to finish
++  // rather than raced -- typing is always the way through.
++  function rearmFace() {
++    if (!lockRequested || !faceConfigured || authenticatingPassword) return
++
++    faceWaitingForWake = false
++    faceAttempts = 0
++    faceRetryTimer.stop()
++    startFace()
++  }
++
+   WlSessionLock {
+     id: sessionLock
+ 
+@@ -238,7 +334,11 @@
+         root.pendingSessionLock = false
+         sessionLockStabilizeTimer.stop()
+         pendingSessionLockTimer.stop()
++        // The pointer grace runs from here, when the lock surface appears
++        // under the cursor, not from the request, which can be seconds earlier.
++        root.lockStartedAt = Date.now()
+         root.startFingerprint()
++        root.startFace()
+       }
+     }
+ 
+@@ -270,7 +370,13 @@
+         anchors.fill: parent
+         backgroundPath: root.backgroundPath
+         backgroundVersion: root.backgroundVersion
++        unlockStyleDir: root.unlockStyleDir
++        defaultLogoPath: root.defaultUnlockLogo
++        styleBackground: root.unlockBackground
++        styleText: root.unlockText
+         fingerprintConfigured: root.fingerprintConfigured
++        faceConfigured: root.faceConfigured
++        faceAuthenticating: root.faceAuthenticating
+         authenticatingPassword: root.authenticatingPassword
+         failureMessage: root.failureMessage
+         failedAttempts: root.failedAttempts
+@@ -280,7 +386,7 @@
+         onPasswordTextEdited: function(password) { root.enteredPassword = password }
+         onSubmitPassword: function(password) { root.submitPassword(password) }
+         onClearFailureRequested: root.failureMessage = ""
+-        onWakeRequested: root.runWake()
++        onWakeRequested: function(pointerOnly) { root.runWake(pointerOnly) }
+       }
+ 
+     }
+@@ -300,7 +406,13 @@
+       anchors.fill: parent
+       backgroundPath: root.backgroundPath
+       backgroundVersion: root.backgroundVersion
++      unlockStyleDir: root.unlockStyleDir
++      defaultLogoPath: root.defaultUnlockLogo
++      styleBackground: root.unlockBackground
++      styleText: root.unlockText
+       fingerprintConfigured: root.fingerprintConfigured
++      faceConfigured: root.faceConfigured
++      faceAuthenticating: false
+       authenticatingPassword: false
+       failureMessage: ""
+       failedAttempts: 0
+@@ -353,6 +465,21 @@
+     }
+   }
+ 
++  PamContext {
++    id: facePam
++    config: "omarchy-lock-face"
++    user: root.userName
++
++    onCompleted: function(result) {
++      root.handleFaceFinished(result)
++    }
++
++    onError: function(error) {
++      root.faceAuthenticating = false
++      if (root.lockRequested && root.faceConfigured && root.faceAttempts < root.faceAttemptBudget) faceRetryTimer.restart()
++    }
++  }
++
+   Timer {
+     id: fingerprintRetryTimer
+     interval: 250
+@@ -360,6 +487,41 @@
+     onTriggered: root.startFingerprint()
+   }
+ 
++  Timer {
++    id: faceRetryTimer
++    // Longer than the fingerprint's quarter second: back-to-back captures leave
++    // the user no room to sit up or open their eyes, and the emitter would stay
++    // lit straight through the gap.
++    interval: 1500
++    repeat: false
++    onTriggered: root.startFace()
++  }
++
++  // The style's colours: its background from the Plymouth script, and its text
++  // colour from the padlock, which omarchy-plymouth-set recolours to exactly
++  // that colour.
++  Process {
++    id: unlockStyleProc
++    command: ["bash", "-c",
++      "export LC_ALL=C; d=\"$1\"; " +
++      "bg=$(sed -n 's/^Window.SetBackgroundTopColor(\\(.*\\));/\\1/p' \"$d/omarchy.script\" | tr ',' '\\n' | awk '{printf \"%02x\", int($1*255+0.5)}'); " +
++      "text=$(magick \"$d/lock.png\" -depth 8 txt:- 2>/dev/null | awk -F'#' '$2 ~ /^[0-9A-Fa-f]{6}[Ff][Ff]/ {print substr($2,1,6); exit}'); " +
++      "echo \"bg=$bg\"; echo \"text=$text\"",
++      "_", root.unlockStyleDir]
++    stdout: StdioCollector {
++      waitForEnd: true
++      onStreamFinished: {
++        var found = { bg: "", text: "" }
++        String(text || "").split("\n").forEach(function(line) {
++          var m = /^(bg|text)=([0-9a-fA-F]{6})$/.exec(line.trim())
++          if (m) found[m[1]] = "#" + m[2]
++        })
++        root.unlockBackground = found.bg
++        root.unlockText = found.text
++      }
++    }
++  }
++
+   Process {
+     id: readlinkProc
+     command: ["readlink", "-f", root.currentBackgroundLink]
+@@ -387,6 +549,21 @@
+   }
+ 
+   Process {
++    id: faceCheckProc
++    // The enrolled model is root-only, so there is no user-readable list to ask
++    // the way fprintd-list answers for fingerprints. Setup writes this file only
++    // once an enroll and a verify have both passed, and removal deletes it, so
++    // its presence is the whole answer.
++    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-face ]]; then echo yes; else echo no; fi"]
++    stdout: StdioCollector { id: faceCheckStdout; waitForEnd: true }
++    onExited: {
++      root.faceConfigured = String(faceCheckStdout.text || "").trim() === "yes"
++      if (root.lockRequested && root.faceConfigured) root.startFace()
++      else if (!root.faceConfigured && facePam.active) facePam.abort()
++    }
++  }
++
++  Process {
+     id: strandedLockCheckProc
+     command: ["bash", "-c", "omarchy-hyprland-session-locked"]
+     onExited: function(exitCode) {
+@@ -411,6 +588,33 @@
+     command: ["bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]
+   }
+ 
++  // Input-idle tracker for faceAwaySeconds. Ignores inhibitors: a video that
++  // keeps the screen awake still means nobody is touching the keyboard.
++  IdleMonitor {
++    id: awayMonitor
++    timeout: root.faceAwaySeconds
++    respectInhibitors: false
++  }
++
++  // Omarchy locks before suspend; a wall-clock jump while locked means the
++  // machine just resumed (lid opened), so look for a face without a key press.
++  Timer {
++    id: resumeWatch
++    interval: 2000
++    repeat: true
++    running: root.lockRequested
++    property double lastTick: 0
++    onRunningChanged: lastTick = Date.now()
++    onTriggered: {
++      var now = Date.now()
++      if (lastTick > 0 && now - lastTick > 10000) {
++        root.logEvent("face: scan after resume")
++        root.rearmFace()
++      }
++      lastTick = now
++    }
++  }
++
+   Timer {
+     id: idleBlankTimer
+     interval: 5000
+@@ -504,6 +708,7 @@
+   Component.onCompleted: {
+     refreshBackground()
+     refreshFingerprintStatus()
++    refreshFaceStatus()
+     checkStrandedLock()
+   }
+ 
+@@ -530,6 +735,8 @@
+         realScreens: root.realScreenCount(),
+         passwordPam: root.passwordPamConfigured,
+         fingerprint: root.fingerprintConfigured,
++        face: root.faceConfigured,
++        faceAttempts: root.faceAttempts,
+         authenticating: root.authenticating,
+         lastEvent: root.lastEvent,
+         lastEventAt: root.lastEventAt
+@@ -539,6 +746,7 @@
+     function preview(): string {
+       root.refreshBackground()
+       root.refreshFingerprintStatus()
++      root.refreshFaceStatus()
+       root.previewVisible = true
+       return "ok"
+     }

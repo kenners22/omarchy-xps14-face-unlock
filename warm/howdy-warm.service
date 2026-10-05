@@ -1,0 +1,26 @@
+[Unit]
+Description=Howdy face recognition kept loaded (fast face unlock)
+Documentation=https://github.com/kenners22/omarchy-xps14-face-unlock
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/howdy-warm/howdy-warmd
+RuntimeDirectory=howdy-warm
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+SyslogIdentifier=howdy-warm
+Environment=PYTHONUNBUFFERED=1
+# Hardening that leaves the camera, its sysfs LED and /etc/howdy reachable
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

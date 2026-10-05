@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+# howdy-warmd: Howdy's face recognition, kept loaded.
+#
+# Stock Howdy starts a fresh Python process for every sudo / polkit / lock-screen
+# scan and spends ~0.9 s importing OpenCV and loading dlib's models before the
+# camera even turns on. This service loads them once and answers requests on a
+# local socket; howdy-warm-auth (run by pam_exec) asks it.
+#
+# The scan itself is compare.py's loop, unchanged in substance: same config
+# (/etc/howdy/config.ini, re-read every request), same face models
+# (/etc/howdy/models/<user>.dat), same camera code (Howdy's VideoCapture, so the
+# IR reader), same certainty threshold, dark-frame handling and timeout.
+#
+# Protocol: client sends "AUTH <user>\n", gets one line back:
+#   OK | NO timeout | NO dark | NO nomodel | NO disabled | NO ssh | NO lid
+#   | NO policy | NO error
+#
+# Policy: a non-root caller may only ask about its own user (SO_PEERCRED), so a
+# local process can't use this to check someone else's face. Callers inside an
+# SSH session are refused, and nothing scans with the lid shut -- the same
+# abort_if_ssh / abort_if_lid_closed rules pam_howdy applies.
+
+import configparser
+import glob
+import json
+import os
+import pwd
+import socket
+import struct
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/lib/howdy")
+
+import cv2  # noqa: E402
+import dlib  # noqa: E402
+import numpy as np  # noqa: E402
+
+import paths_factory  # noqa: E402
+from recorders.video_capture import VideoCapture  # noqa: E402
+
+# The override is for testing the service as a normal user; the client never
+# takes one (a user-chosen socket could answer "OK" for sudo).
+SOCKET_PATH = os.environ.get("HOWDY_WARM_SOCKET", "/run/howdy-warm/socket")
+SCANNING_FLAG = os.path.join(os.path.dirname(SOCKET_PATH), "scanning")  # read by the bar widget
+
+camera_lock = threading.Lock()
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def load_config():
+    config = configparser.ConfigParser()
+    config.read(paths_factory.config_file_path())
+    return config
+
+
+# --- Models: loaded once, the whole point of this service ---------------------
+_start = time.time()
+_config = load_config()
+USE_CNN = _config.getboolean("core", "use_cnn", fallback=False)
+if USE_CNN:
+    face_detector = dlib.cnn_face_detection_model_v1(paths_factory.mmod_human_face_detector_path())
+else:
+    face_detector = dlib.get_frontal_face_detector()
+pose_predictor = dlib.shape_predictor(paths_factory.shape_predictor_5_face_landmarks_path())
+face_encoder = dlib.face_recognition_model_v1(paths_factory.dlib_face_recognition_resnet_model_v1_path())
+# Run the detector once so its first real use doesn't pay for warm-up
+face_detector(np.zeros((240, 320), dtype=np.uint8), 1)
+log("models loaded in %.2fs (cnn=%s)" % (time.time() - _start, USE_CNN))
+
+
+# --- Checks pam_howdy makes before scanning -----------------------------------
+def lid_closed():
+    for state in glob.glob("/proc/acpi/button/lid/*/state"):
+        try:
+            if "closed" in open(state).read():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def in_ssh_session(pid):
+    """Walk the caller's ancestors looking for an SSH session's environment."""
+    for _ in range(16):
+        if pid <= 1:
+            return False
+        try:
+            env = open("/proc/%d/environ" % pid, "rb").read().split(b"\0")
+            if any(e.startswith((b"SSH_CONNECTION=", b"SSH_CLIENT=", b"SSH_TTY=")) for e in env):
+                return True
+            stat = open("/proc/%d/stat" % pid).read()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])  # ppid
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+# --- The scan: compare.py's main loop -----------------------------------------
+def scan(user, config):
+    try:
+        models = json.load(open(paths_factory.user_model_path(user)))
+    except (FileNotFoundError, ValueError):
+        return "NO nomodel"
+    encodings = []
+    for model in models:
+        encodings += model["data"]
+    if not encodings:
+        return "NO nomodel"
+    encodings = np.array(encodings)
+
+    timeout = config.getint("video", "timeout", fallback=4)
+    dark_threshold = config.getfloat("video", "dark_threshold", fallback=60)
+    video_certainty = config.getfloat("video", "certainty", fallback=3.5) / 10
+    max_height = config.getfloat("video", "max_height", fallback=320.0)
+    rotate = config.getint("video", "rotate", fallback=0)
+    exposure = config.getint("video", "exposure", fallback=-1)
+
+    video_capture = VideoCapture(config)
+    try:
+        height = video_capture.internal.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1
+        if rotate == 2:
+            height = video_capture.internal.get(cv2.CAP_PROP_FRAME_WIDTH) or 1
+        scaling_factor = (max_height / height) or 1
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+        frames = valid_frames = dark_tries = 0
+        lowest = 10.0
+        start = time.time()
+        while True:
+            frames += 1
+            if time.time() - start > timeout:
+                log("%s: no match in %ds (frames %d, dark %d, best %.2f)" % (user, timeout, frames, dark_tries, lowest * 10))
+                return "NO dark" if dark_tries == valid_frames else "NO timeout"
+
+            # VideoCapture.read_frame sys.exit()s on a failed read; that must
+            # not take the whole service down
+            try:
+                frame, gsframe = video_capture.read_frame()
+            except SystemExit:
+                log("%s: camera read failed" % user)
+                return "NO error"
+            gsframe = clahe.apply(gsframe)
+
+            hist = cv2.calcHist([gsframe], [0], None, [8], [0, 256])
+            hist_total = np.sum(hist)
+            darkness = hist[0] / hist_total * 100 if hist_total else 100
+            if hist_total == 0 or darkness == 100:
+                continue
+            valid_frames += 1
+            if darkness > dark_threshold:
+                dark_tries += 1
+                continue
+
+            if scaling_factor != 1:
+                frame = cv2.resize(frame, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
+                gsframe = cv2.resize(gsframe, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
+
+            if rotate == 1:
+                if frames % 3 == 1:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                if frames % 3 == 2:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_CLOCKWISE)
+            elif rotate == 2:
+                if frames % 2 == 0:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                else:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_CLOCKWISE)
+
+            for fl in face_detector(gsframe, 1):
+                if USE_CNN:
+                    fl = fl.rect
+                landmark = pose_predictor(frame, fl)
+                encoding = np.array(face_encoder.compute_face_descriptor(frame, landmark, 1))
+                matches = np.linalg.norm(encodings - encoding, axis=1)
+                match = matches[np.argmin(matches)]
+                lowest = min(lowest, match)
+                if 0 < match < video_certainty:
+                    log("%s: Login approved (certainty %.2f, %d frames, %.2fs)" % (user, match * 10, frames, time.time() - start))
+                    return "OK"
+
+            if exposure != -1:
+                video_capture.internal.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+                video_capture.internal.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+    finally:
+        video_capture.release()
+
+
+def handle(conn):
+    try:
+        conn.settimeout(5)
+        pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        line = conn.makefile("r").readline().strip()
+        if not line.startswith("AUTH "):
+            return
+        user = line[5:]
+        conn.settimeout(None)
+
+        try:
+            caller = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            caller = None
+        if uid != 0 and caller != user:
+            log("refused: uid %d asked about %r" % (uid, user))
+            conn.sendall(b"NO policy\n")
+            return
+
+        config = load_config()
+        if config.getboolean("core", "disabled", fallback=False):
+            conn.sendall(b"NO disabled\n")
+            return
+        if config.getboolean("core", "abort_if_ssh", fallback=True) and in_ssh_session(pid):
+            log("%s: refused, SSH session" % user)
+            conn.sendall(b"NO ssh\n")
+            return
+        if config.getboolean("core", "abort_if_lid_closed", fallback=True) and lid_closed():
+            conn.sendall(b"NO lid\n")
+            return
+
+        # One camera: requests take turns
+        with camera_lock:
+            open(SCANNING_FLAG, "w").close()
+            try:
+                result = scan(user, config)
+            # never let one bad scan kill the service; Howdy's VideoCapture
+            # sys.exit()s when it can't open the camera
+            except (Exception, SystemExit) as e:
+                log("%s: scan error: %r" % (user, e))
+                result = "NO error"
+            finally:
+                try:
+                    os.unlink(SCANNING_FLAG)
+                except OSError:
+                    pass
+        conn.sendall((result + "\n").encode())
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
+def main():
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    # Anyone may connect; handle() decides who may ask about whom
+    os.chmod(SOCKET_PATH, 0o666)
+    server.listen(8)
+    log("listening on %s" % SOCKET_PATH)
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+# Omarchy's 71-ipu7-hide-isys.rules makes every raw IPU7 capture node root-only so
+# browsers don't list dozens of fake cameras. Howdy's IR reader runs as the user on
+# the lock screen, so give the logged-in user back just the HM1092 IR node
+# (CSI2 port 2 -> ISYS Capture 16 on the XPS 14 DA14260).
+SUBSYSTEM=="video4linux", ATTR{name}=="Intel IPU7 ISYS Capture 16", TAG+="uaccess", GROUP="video", MODE="0660"

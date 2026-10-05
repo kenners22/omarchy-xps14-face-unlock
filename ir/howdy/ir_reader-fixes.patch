@@ -1,0 +1,70 @@
+--- a/ir_reader.py
++++ b/ir_reader.py
+@@ -23,6 +23,7 @@
+ #   2026-07-25 defaults to the corrected value.
+ 
+ import fcntl
++import select
+ import mmap
+ import os
+ import re
+@@ -37,6 +38,8 @@
+ # 'BA10' = V4L2_PIX_FMT_SGRBG10
+ PIX_FMT_SGRBG10 = 0x30314142
+ NBUF = 4
++# Longest wait for one frame before giving up (first frame takes ~0.3 s)
++FRAME_TIMEOUT_S = 2.0
+ 
+ # The IR flood illuminator. INT3472 claims this GPIO and exposes it as a LED
+ # class device, which is why the hm1092 driver reports ir_led=none and cannot
+@@ -92,8 +95,8 @@
+ 
+ def _topology(dev):
+ 	try:
+-		return subprocess.run(["media-ctl", "-d", dev, "-p"],
+-				      capture_output=True, text=True, timeout=10).stdout
++		return subprocess.run(["/usr/bin/media-ctl", "-d", dev, "-p"],
++				      capture_output=True, text=True, timeout=3).stdout
+ 	except (OSError, subprocess.SubprocessError):
+ 		return ""
+ 
+@@ -151,8 +154,8 @@
+ 			["-l", '"%s":1 -> "%s":0 [1]' % (csi2, cap)],
+ 		):
+ 			try:
+-				subprocess.run(["media-ctl", "-d", dev] + args,
+-					       capture_output=True, timeout=10)
++				subprocess.run(["/usr/bin/media-ctl", "-d", dev] + args,
++					       capture_output=True, timeout=3)
+ 			except (OSError, subprocess.SubprocessError):
+ 				pass
+ 
+@@ -189,10 +192,10 @@
+ 
+ 	# -- cv2-compatible getters/setters --------------------------------------
+ 	def set(self, prop, setting):
+-		if prop == CAP_PROP_FRAME_WIDTH:
+-			self.width = int(setting)
+-		elif prop == CAP_PROP_FRAME_HEIGHT:
+-			self.height = int(setting)
++		# The sensor has one mode and the buffers are already sized by S_FMT;
++		# changing width/height here would only mis-slice the mmap in read().
++		# Ignore frame_width/frame_height from config.ini. (omarchy-xps14-face-unlock change)
++		pass
+ 
+ 	def get(self, prop):
+ 		if prop == CAP_PROP_FRAME_WIDTH:
+@@ -258,6 +261,13 @@
+ 		if not self.streaming:
+ 			self.record()
+ 
++		# Howdy only checks its timeout between frames and pam_howdy waits on
++		# compare.py with no limit, so a blocking DQBUF on a stalled stream would
++		# hang sudo / the lock screen. Give up instead; Howdy then fails and PAM
++		# falls back to the password. (omarchy-xps14-face-unlock change)
++		if not select.select([self.fd], [], [], FRAME_TIMEOUT_S)[0]:
++			return False, None
++
+ 		buf = v4l2.v4l2_buffer()
+ 		buf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+ 		buf.memory = v4l2.V4L2_MEMORY_MMAP
