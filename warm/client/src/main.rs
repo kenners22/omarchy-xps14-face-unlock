@@ -1,8 +1,9 @@
 //! howdy-warm-auth: run by pam_exec in place of pam_howdy.
 //!
 //! Asks howdy-warmd (Howdy with its models kept loaded) to look for PAM_USER's
-//! face and exits 0 only on a match. If the service isn't running, it hands
-//! over to stock Howdy's compare.py, so face unlock keeps working (just slower).
+//! face and exits 0 only on a match. If the service isn't running, or answers
+//! FALLBACK (a Howdy setup it doesn't handle), it hands over to stock Howdy's
+//! compare.py, so face unlock keeps working (just slower).
 //! Anything else -- timeout, refusal, a garbled reply -- is a failure, and PAM
 //! moves on to the password.
 
@@ -24,6 +25,12 @@ fn valid_user(u: &str) -> bool {
         && u.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// Run stock Howdy in our place. exec only returns on error.
+fn stock_howdy(user: &str) -> ! {
+    let _ = Command::new("/usr/bin/python3").arg(COMPARE).arg(user).exec();
+    exit(1);
+}
+
 fn main() {
     // pam_exec exports PAM_USER; an argument is accepted for testing by hand.
     let user = env::var("PAM_USER")
@@ -37,11 +44,8 @@ fn main() {
 
     let mut stream = match UnixStream::connect(SOCKET) {
         Ok(s) => s,
-        Err(_) => {
-            // Service down: same result as before it existed. exec only returns on error.
-            let _ = Command::new("/usr/bin/python3").arg(COMPARE).arg(&user).exec();
-            exit(1);
-        }
+        // Service down: same result as before it existed.
+        Err(_) => stock_howdy(&user),
     };
     let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -56,6 +60,7 @@ fn main() {
 
     // Shown by sudo when pam_exec runs with `stdout`; ignored elsewhere.
     match reply.trim() {
+        "FALLBACK" => stock_howdy(&user),
         "OK" => {
             println!("Identified face as {user}");
             exit(0);

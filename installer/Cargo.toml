@@ -1,0 +1,9 @@
+[package]
+name = "face-unlock"
+version = "1.0.0"
+edition = "2021"
+description = "Installs IR face unlock for the Dell XPS 14 (2026) on Omarchy: Howdy, the IR camera, the warm service and the lock screen"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"

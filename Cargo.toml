@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["installer", "warm/client", "warm/daemon"]
+# The daemon needs dlib (pacman: dlib) to build, so a plain `cargo build`
+# leaves it out; `face-unlock warm` installs dlib and builds it.
+default-members = ["installer", "warm/client"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

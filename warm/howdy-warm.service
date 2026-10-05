@@ -5,13 +5,12 @@ After=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/lib/howdy-warm/howdy-warmd
+ExecStart=/usr/local/lib/howdy-warm/howdy-warmd
 RuntimeDirectory=howdy-warm
 RuntimeDirectoryMode=0755
 Restart=on-failure
 RestartSec=2
 SyslogIdentifier=howdy-warm
-Environment=PYTHONUNBUFFERED=1
 # Hardening that leaves the camera, its sysfs LED and /etc/howdy reachable
 NoNewPrivileges=yes
 ProtectHome=yes
