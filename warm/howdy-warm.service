@@ -5,13 +5,15 @@ After=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/lib/howdy-warm/howdy-warmd
+ExecStart=/usr/local/lib/howdy-warm/howdy-warmd
 RuntimeDirectory=howdy-warm
 RuntimeDirectoryMode=0755
 Restart=on-failure
+# A scan killed hard (SIGKILL, a wedged STREAMOFF) skips the service's own
+# LED-off handler; this runs after the process is gone, however it ended.
+ExecStopPost=-/bin/sh -c 'echo 0 > "/sys/class/leds/HIMX1092_00::ir_flood_led/brightness"'
 RestartSec=2
 SyslogIdentifier=howdy-warm
-Environment=PYTHONUNBUFFERED=1
 # Hardening that leaves the camera, its sysfs LED and /etc/howdy reachable
 NoNewPrivileges=yes
 ProtectHome=yes
