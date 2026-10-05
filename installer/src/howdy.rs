@@ -21,13 +21,23 @@ pub fn get(key: &str) -> Option<String> {
 
 /// `sed -i "s|^key *=.*|key = value|"`, then show the line, as the scripts did.
 pub fn set(key: &str, value: &str) -> Result {
-    let text: String = sys::read_root(CFG)?
-        .lines()
-        .map(|l| if is_key(l, key) { format!("{key} = {value}\n") } else { format!("{l}\n") })
-        .collect();
+    set_all(&[(key, value)])
+}
+
+/// Several settings in one write, so the config is never left half-switched.
+pub fn set_all(pairs: &[(&str, &str)]) -> Result {
+    let mut text = sys::read_root(CFG)?;
+    for (key, value) in pairs {
+        text = text
+            .lines()
+            .map(|l| if is_key(l, key) { format!("{key} = {value}\n") } else { format!("{l}\n") })
+            .collect();
+    }
     sys::sudo_write(CFG, &text)?;
-    for l in text.lines().filter(|l| l.starts_with(&format!("{key} "))) {
-        println!("{l}");
+    for (key, _) in pairs {
+        for l in text.lines().filter(|l| l.starts_with(&format!("{key} "))) {
+            println!("{l}");
+        }
     }
     Ok(())
 }

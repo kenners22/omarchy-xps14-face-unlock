@@ -5,18 +5,25 @@
 //! omarchy.lock), which starts a face scan as soon as
 //! /etc/pam.d/omarchy-lock-face exists.
 
-use crate::pam::{self, HOWDY_REQUIRED, HOWDY_SUFFICIENT, LOCK_FACE, LOCK_PASSWORD, WARM_CLIENT, WARM_REQUIRED};
+use crate::pam::{self, HOWDY_REQUIRED, HOWDY_SUFFICIENT, LOCK_FACE, LOCK_PASSWORD, WARM_CLIENT, WARM_REQUIRED, WARM_SUFFICIENT};
 use crate::sys::{self, green, run, sudo, Result};
 
 pub fn undo() -> Result {
-    run(&mut sudo(&["rm", "-f", LOCK_FACE]))?;
+    let old = sys::read_root(LOCK_PASSWORD)?;
+    if !old.lines().any(|l| l.contains("pam_faillock.so preauth")) {
+        crate::bail!("{LOCK_PASSWORD} has no pam_faillock preauth line to put face unlock after. Nothing changed.");
+    }
+    // Back to "any key + Enter, then look at the camera", through the warm
+    // client when sudo uses it
+    let face = if pam::warm_in_use() { WARM_SUFFICIENT } else { HOWDY_SUFFICIENT };
     sys::edit(LOCK_PASSWORD, |t| {
-        if t.contains("pam_howdy.so") {
+        if t.contains("pam_howdy.so") || t.contains(WARM_CLIENT) {
             t.to_string()
         } else {
-            sys::insert_after(t, |l| l.contains("pam_faillock.so preauth"), HOWDY_SUFFICIENT)
+            sys::insert_after(t, |l| l.contains("pam_faillock.so preauth"), face)
         }
     })?;
+    run(&mut sudo(&["rm", "-f", LOCK_FACE]))?;
     println!("Auto-scan off. Lock screen is back to: type any key + Enter, then look at the camera.");
     Ok(())
 }

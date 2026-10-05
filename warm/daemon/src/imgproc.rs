@@ -189,6 +189,9 @@ pub fn resize_area(src: &Image, f: f64) -> Option<Image> {
     // dsize = (saturate_cast<int>(w * f), saturate_cast<int>(h * f))
     let dw = (src.width as f64 * f).round_ties_even() as usize;
     let dh = (src.height as f64 * f).round_ties_even() as usize;
+    if dw == 0 || dh == 0 {
+        return None;
+    }
     let xtab = area_tab(src.width, dw, scale);
     let ytab = area_tab(src.height, dh, scale);
 
@@ -273,6 +276,11 @@ mod tests {
         let r = resize_area(&flat, 240.0 / 368.0).unwrap();
         assert_eq!((r.width, r.height), (423, 240));
         assert!(r.data.iter().all(|&p| p == 77));
+    }
+
+    #[test]
+    fn area_resize_refuses_an_empty_result() {
+        assert!(resize_area(&img(10, 2), 0.2).is_none());
     }
 
     #[test]

@@ -18,7 +18,10 @@ pub fn undo() -> Result {
         bail!("Face unlock goes through the warm service. First: face-unlock warm --undo");
     }
     for f in [pam::SUDO, pam::POLKIT, pam::LOCK_PASSWORD] {
-        if sys::edit(f, |t| sys::delete_lines(t, "pam_howdy.so"))? {
+        let without_face = |t: &str| -> String {
+            sys::delete_lines(t, "pam_howdy.so").lines().filter(|l| *l != pam::FAILLOCK_GUARD).map(|l| format!("{l}\n")).collect()
+        };
+        if sys::edit(f, without_face)? {
             println!("Removed from {f}");
         }
     }
@@ -109,13 +112,13 @@ pub fn install() -> Result {
     };
 
     // sudo
-    sys::edit(pam::SUDO, after_first_line)?;
+    sys::edit(pam::SUDO, |t| pam::guard_faillock(&after_first_line(t)))?;
 
     // polkit (system dialogs + 1Password "unlock using system authentication")
     if !sys::exists(pam::POLKIT) {
         run(&mut sudo(&["cp", "/usr/lib/pam.d/polkit-1", pam::POLKIT]))?;
     }
-    sys::edit(pam::POLKIT, after_first_line)?;
+    sys::edit(pam::POLKIT, |t| pam::guard_faillock(&after_first_line(t)))?;
 
     // Lock screen, after the faillock preauth line. Skipped when auto-scan is on:
     // then omarchy-lock-face does the scanning and Enter must stay password-only,

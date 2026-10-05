@@ -187,12 +187,14 @@ pub fn enable_howdy() -> Result {
 
     // 3. Config: IR frames are mostly dark background, so raise dark_threshold
     run(&mut sudo(&["cp", "-a", CFG, &format!("{CFG}.bak.{}", stamp())]))?;
-    howdy::set("recording_plugin", "ir")?;
-    howdy::set("device_path", "/dev/video16")?;
-    howdy::set("dark_threshold", "90")?;
-    // Search a 240-high image (the IR frame is 368): ~0.3 s faster per scan, still a
-    // clear match (certainty 2.0-3.1 against the 3.5 limit) -- measured 2026-10-02
-    howdy::set("max_height", "240")?;
+    howdy::set_all(&[
+        ("recording_plugin", "ir"),
+        ("device_path", "/dev/video16"),
+        ("dark_threshold", "90"),
+        // Search a 240-high image (the IR frame is 368): ~0.3 s faster per scan, still a
+        // clear match (certainty 2.0-3.1 against the 3.5 limit) -- measured 2026-10-02
+        ("max_height", "240"),
+    ])?;
 
     // 4. RGB face models don't match IR images: enrol again
     enroll()?;
@@ -226,9 +228,8 @@ pub fn disable_howdy() -> Result {
     };
     howdy::start_rgb_relay()?;
     run(&mut sudo(&["cp", "-a", CFG, &format!("{CFG}.bak.{}", stamp())]))?;
-    howdy::set("recording_plugin", "opencv")?;
-    howdy::set("device_path", &rgb)?;
-    howdy::set("dark_threshold", "60")?;
+    // max_height back to Howdy's default, for the RGB camera
+    howdy::set_all(&[("recording_plugin", "opencv"), ("device_path", &rgb), ("dark_threshold", "60"), ("max_height", "320")])?;
     run(&mut sudo(&["rm", "-f", RULE]))?;
     reload_ir_node_rules()?;
     enroll()?;

@@ -18,6 +18,7 @@ const PIX_FMT_SGRBG10: u32 = 0x3031_4142; // 'BA10'
 const NBUF: u32 = 4;
 /// Longest wait for one frame before giving up (the first takes ~0.3 s).
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_CTL_TIMEOUT: Duration = Duration::from_secs(3);
 
 // <linux/videodev2.h>, x86_64 (sizes checked against the kernel headers)
 const VIDIOC_S_FMT: u64 = 0xc0d0_5605;
@@ -114,12 +115,37 @@ pub fn ir_led_state() -> String {
 
 // --- media graph (ir_reader.configure_pipeline) -----------------------------
 
+/// Run media-ctl and return its stdout, killing it after 3 s as Howdy's IR
+/// reader does: a hung IPU7 ioctl must not hold the camera lock forever.
+fn media_ctl(args: &[&str]) -> Option<String> {
+    let mut child = Command::new(MEDIA_CTL)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut s);
+        s
+    });
+    let deadline = std::time::Instant::now() + MEDIA_CTL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return reader.join().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn topology(dev: &str) -> String {
-    Command::new(MEDIA_CTL)
-        .args(["-d", dev, "-p"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+    media_ctl(&["-d", dev, "-p"]).unwrap_or_default()
 }
 
 /// "- entity 12: name (1 pad, ...)" -> "name"
@@ -180,7 +206,7 @@ pub fn configure_pipeline() -> Option<String> {
             ["--set-v4l2".to_string(), format!("\"{csi2}\":1 [fmt:{FMT}]")],
             ["-l".to_string(), format!("\"{csi2}\":1 -> \"{cap}\":0 [1]")],
         ] {
-            let _ = Command::new(MEDIA_CTL).args(["-d", &dev]).args(&args).output();
+            media_ctl(&["-d", &dev, &args[0], &args[1]]);
         }
         let mut ent = None;
         for line in topology(&dev).lines() {

@@ -99,24 +99,38 @@ fn lid_closed() -> bool {
 }
 
 /// Walk the caller's ancestors looking for an SSH session's environment.
+/// Fails closed: if the walk can't finish (the caller already exited, or an
+/// ancestor vanished mid-walk), it counts as SSH.
 fn in_ssh_session(mut pid: i32) -> bool {
-    for _ in 0..16 {
+    for _ in 0..64 {
         if pid <= 1 {
             return false;
         }
-        let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else { return false };
+        let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else { return true };
         if environ.split(|&b| b == 0).any(|e| {
             e.starts_with(b"SSH_CONNECTION=") || e.starts_with(b"SSH_CLIENT=") || e.starts_with(b"SSH_TTY=")
         }) {
             return true;
         }
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { return true };
         match stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok()) {
             Some(ppid) => pid = ppid,
-            None => return false,
+            None => return true,
         }
     }
-    false
+    true
+}
+
+/// Does logind have a remote (SSH) session open for `uid`? This holds however
+/// the request was started -- `systemd-run --user`, `at`, a D-Bus service --
+/// where the environment walk above can't see an SSH ancestor.
+fn remote_session(uid: u32) -> bool {
+    let Ok(dir) = fs::read_dir("/run/systemd/sessions") else { return false };
+    dir.flatten().filter(|e| !e.file_name().to_string_lossy().contains('.')).any(|e| {
+        let s = fs::read_to_string(e.path()).unwrap_or_default();
+        let has = |line: &str| s.lines().any(|l| l == line);
+        has(&format!("UID={uid}")) && has("REMOTE=1") && !has("STATE=closing")
+    })
 }
 
 // --- The scan: compare.py's main loop ----------------------------------------
@@ -291,6 +305,15 @@ fn peer(conn: &UnixStream) -> Option<(i32, u32)> {
     (rc == 0).then_some((cred.pid, cred.uid))
 }
 
+fn user_uid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut res = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwnam_r(cname.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut res) };
+    (rc == 0 && !res.is_null()).then_some(pw.pw_uid)
+}
+
 fn user_name(uid: u32) -> Option<String> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
@@ -344,7 +367,8 @@ fn handle(mut conn: UnixStream, warm: &Mutex<Warm>, scanning_flag: &Path) {
     if config.bool("core", "disabled", false) {
         return reply("NO disabled");
     }
-    if config.bool("core", "abort_if_ssh", true) && in_ssh_session(pid) {
+    let remote = || [Some(uid), user_uid(&user)].into_iter().flatten().any(remote_session);
+    if config.bool("core", "abort_if_ssh", true) && (in_ssh_session(pid) || remote()) {
         log!("{user}: refused, SSH session");
         return reply("NO ssh");
     }
@@ -460,8 +484,64 @@ fn main() {
 
     let warm = Arc::new(Mutex::new(Warm { models, use_cnn }));
     let scanning_flag = Arc::new(scanning_flag);
-    for conn in listener.incoming().flatten() {
+    let slots = Arc::new(Slots::default());
+    for conn in listener.incoming() {
+        let conn = match conn {
+            Ok(c) => c,
+            // e.g. out of file descriptors: don't spin
+            Err(_) => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        // Any local user can connect, so cap what they can queue: over the cap
+        // the connection is just closed, and that request falls to the password.
+        let Some((_, uid)) = peer(&conn) else { continue };
+        let Some(slot) = Slots::take(&slots, uid) else { continue };
         let (warm, flag) = (warm.clone(), scanning_flag.clone());
-        thread::spawn(move || handle(conn, &warm, &flag));
+        thread::spawn(move || {
+            let _slot = slot;
+            handle(conn, &warm, &flag)
+        });
+    }
+}
+
+/// Open requests, in all and per caller uid.
+#[derive(Default)]
+struct Slots {
+    per_uid: Mutex<std::collections::HashMap<u32, usize>>,
+}
+
+const MAX_REQUESTS: usize = 16;
+const MAX_REQUESTS_PER_UID: usize = 2;
+
+/// One open request; frees its place when dropped.
+struct Slot {
+    slots: Arc<Slots>,
+    uid: u32,
+}
+
+impl Slots {
+    fn take(slots: &Arc<Slots>, uid: u32) -> Option<Slot> {
+        let mut per_uid = slots.per_uid.lock().unwrap_or_else(|e| e.into_inner());
+        let total: usize = per_uid.values().sum();
+        let mine = per_uid.entry(uid).or_insert(0);
+        if total >= MAX_REQUESTS || *mine >= MAX_REQUESTS_PER_UID {
+            return None;
+        }
+        *mine += 1;
+        Some(Slot { slots: slots.clone(), uid })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut per_uid = self.slots.per_uid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = per_uid.get_mut(&self.uid) {
+            *n -= 1;
+            if *n == 0 {
+                per_uid.remove(&self.uid);
+            }
+        }
     }
 }

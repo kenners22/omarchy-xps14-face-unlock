@@ -97,19 +97,30 @@ pub fn sudo_v() -> Result {
     run(&mut sudo(&["-v"]))
 }
 
-/// Write a root-owned file (keeps its owner and mode if it exists).
+/// Write a root-owned file atomically: the new contents go to a temporary file
+/// beside it, which then replaces it in one rename. A run killed half-way
+/// leaves the old file whole, never an empty /etc/pam.d/sudo. Keeps the
+/// existing file's owner and mode.
 pub fn sudo_write(path: &str, content: &str) -> Result {
-    let mut child = sudo(&["tee", path])
+    let tmp = format!("{path}.face-unlock-new");
+    let mut child = sudo(&["tee", &tmp])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-        .map_err(|e| format!("sudo tee {path}: {e}"))?;
+        .map_err(|e| format!("sudo tee {tmp}: {e}"))?;
     child.stdin.take().unwrap().write_all(content.as_bytes()).map_err(|e| e.to_string())?;
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
+        let _ = ok(&mut sudo(&["rm", "-f", &tmp]));
         bail!("couldn't write {path}");
     }
-    Ok(())
+    if exists(path) {
+        run(&mut sudo(&["chmod", "--reference", path, &tmp]))?;
+        run(&mut sudo(&["chown", "--reference", path, &tmp]))?;
+    } else {
+        run(&mut sudo(&["chmod", "0644", &tmp]))?;
+    }
+    run(&mut sudo(&["mv", "-f", &tmp, path]))
 }
 
 /// `sudo cp -a FILE FILE.bak.<stamp>`, if FILE exists.

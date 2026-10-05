@@ -4,6 +4,7 @@
 // side does everything else, including the image preparation (imgproc.rs).
 
 #include <cstring>
+#include <memory>
 #include <exception>
 #include <vector>
 
@@ -82,7 +83,7 @@ fw_models *fw_load(const char *sp_path, const char *rec_path, const char *cnn_pa
         // One thread: as fast as many for one 150px face, and no idle pool
         // spinning on every core after each scan.
         openblas_set_num_threads(1);
-        auto *m = new fw_models;
+        auto m = std::make_unique<fw_models>();
         if (cnn_path) {
             m->use_cnn = true;
             deserialize(cnn_path) >> m->cnn;
@@ -91,7 +92,7 @@ fw_models *fw_load(const char *sp_path, const char *rec_path, const char *cnn_pa
         }
         deserialize(sp_path) >> m->sp;
         deserialize(rec_path) >> m->net;
-        return m;
+        return m.release();
     } catch (std::exception &e) {
         set_err(err, errlen, e.what());
     } catch (...) {

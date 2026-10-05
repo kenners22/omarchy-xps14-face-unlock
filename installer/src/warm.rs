@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::bail;
-use crate::pam::{HOWDY_REQUIRED, HOWDY_SUFFICIENT, WARM_CLIENT, WARM_REQUIRED, WARM_SUFFICIENT, WARM_STACKS};
+use crate::pam::{self, HOWDY_REQUIRED, HOWDY_SUFFICIENT, WARM_CLIENT, WARM_REQUIRED, WARM_SUFFICIENT, WARM_STACKS};
 use crate::sys::{self, cmd, green, output, run, stamp, sudo, user, Result};
 
 const LIB: &str = "/usr/local/lib/howdy-warm";
@@ -26,13 +26,14 @@ fn switch_pam(to_warm: bool) -> Result {
             continue;
         }
         let changed = sys::edit(f, |t| {
-            pairs.iter().fold(t.to_string(), |t, (howdy, warm)| {
+            let t = pairs.iter().fold(t.to_string(), |t, (howdy, warm)| {
                 if to_warm {
                     sys::swap_line(&t, howdy, warm)
                 } else {
                     sys::swap_line(&t, warm, howdy)
                 }
-            })
+            });
+            pam::guard_faillock(&t)
         })?;
         if changed {
             println!("  {f}");
