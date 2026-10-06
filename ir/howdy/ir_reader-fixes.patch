@@ -39,7 +39,127 @@
  			except (OSError, subprocess.SubprocessError):
  				pass
  
-@@ -189,10 +192,10 @@
+@@ -167,6 +170,114 @@
+ 	return None
+ 
+ 
++# Auto-exposure (omarchy-xps14-face-unlock change). The sensor has none, and the
++# driver starts every stream at its init table's exposure (0x00b4), which
++# saturates ~95% of the frame in sunlight. hm1092_set_ctrl() drops controls
++# while not streaming -- including the ones stream-on applies -- so exposure
++# can only be changed after STREAMON, and lands about two frames later.
++V4L2_CID_EXPOSURE = 0x00980911
++VIDIOC_G_CTRL = 0xC008561B
++VIDIOC_S_CTRL = 0xC008561C
++EXP_MIN, EXP_MAX = 2, 720
++# Mean of the centre of the frame (where the face is) to aim for, 10-bit,
++# and how far off it may be before exposure is touched.
++AE_TARGET = 300
++AE_BAND = 0.25
++# Share of saturated centre pixels that means "far too bright": cut by 4.
++AE_SATURATED = 0.05
++# Frames to wait after a change before judging again.
++AE_SETTLE = 2
++
++
++class _v4l2_control(ctypes.Structure):
++	_fields_ = [("id", ctypes.c_uint32), ("value", ctypes.c_int32)]
++
++
++def _sensor_subdev():
++	"""The sensor's /dev/v4l-subdevN, by name from sysfs (no media-ctl, so it
++	also works in polkit's sandbox, which blocks /dev/media*)."""
++	base = "/sys/class/video4linux"
++	try:
++		for d in sorted(os.listdir(base)):
++			if not d.startswith("v4l-subdev"):
++				continue
++			with open(os.path.join(base, d, "name")) as f:
++				if f.read().startswith(SENSOR_ENTITY):
++					return "/dev/" + d
++	except OSError:
++		pass
++	return None
++
++
++class _AutoExposure:
++	"""Keeps the face region exposed by setting the sensor's exposure mid-stream.
++	Any failure turns it off; capture carries on at the driver's exposure."""
++
++	def __init__(self):
++		self.fd = None
++		self.exp = None
++		self.settle = 0
++		node = _sensor_subdev()
++		if node:
++			try:
++				self.fd = os.open(node, os.O_RDWR)
++			except OSError:
++				self.fd = None
++
++	def _set(self, value):
++		fcntl.ioctl(self.fd, VIDIOC_S_CTRL, _v4l2_control(V4L2_CID_EXPOSURE, int(value)))
++
++	def start(self):
++		"""After STREAMON: re-apply the last exposure the control holds, so a
++		scan starts where the previous one converged. V4L2 skips a write of the
++		cached value, so step off it and back to make the driver write it."""
++		if self.fd is None:
++			return
++		try:
++			ctrl = _v4l2_control(V4L2_CID_EXPOSURE, 0)
++			fcntl.ioctl(self.fd, VIDIOC_G_CTRL, ctrl)
++			self.exp = min(EXP_MAX, max(EXP_MIN, ctrl.value))
++			self._set(self.exp + 1 if self.exp < EXP_MAX else self.exp - 1)
++			self._set(self.exp)
++			self.settle = AE_SETTLE
++		except OSError:
++			self.close()
++
++	def update(self, frame):
++		"""Judge one 10-bit frame (height x width) and adjust exposure."""
++		if self.fd is None or self.exp is None:
++			return
++		if self.settle:
++			self.settle -= 1
++			return
++		h, w = frame.shape
++		centre = frame[h // 6:h * 5 // 6, w // 4:w * 3 // 4]
++		mean = float(centre.mean())
++		if float((centre >= 1000).mean()) > AE_SATURATED:
++			new = self.exp // 4
++		elif abs(mean - AE_TARGET) <= AE_TARGET * AE_BAND:
++			return
++		else:
++			new = round(self.exp * AE_TARGET / max(mean, 1.0))
++		new = min(EXP_MAX, max(EXP_MIN, new))
++		if new == self.exp:
++			return
++		try:
++			self._set(new)
++			self.exp = new
++			self.settle = AE_SETTLE
++		except OSError:
++			self.close()
++
++	def close(self):
++		if self.fd is not None:
++			try:
++				_os_close(self.fd)  # bound at import: may run during shutdown
++			except OSError:
++				pass
++		self.fd = None
++
++
+ class ir_reader:
+ 	"""Looks like the subset of cv2.VideoCapture that Howdy actually uses."""
+ 
+@@ -185,14 +296,15 @@
+ 		if discovered and discovered != device_name:
+ 			# node numbers shuffle between boots -- trust the graph over config.ini
+ 			self.device_name = discovered
++		self.ae = _AutoExposure()
+ 		self._open()
  
  	# -- cv2-compatible getters/setters --------------------------------------
  	def set(self, prop, setting):
@@ -54,7 +174,15 @@
  
  	def get(self, prop):
  		if prop == CAP_PROP_FRAME_WIDTH:
-@@ -258,6 +261,13 @@
+@@ -246,6 +358,7 @@
+ 		typ = ctypes.c_int(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		fcntl.ioctl(self.fd, v4l2.VIDIOC_STREAMON, typ)
+ 		self.streaming = True
++		self.ae.start()
+ 
+ 	# -- capture --------------------------------------------------------------
+ 	def grab(self):
+@@ -258,6 +371,13 @@
  		if not self.streaming:
  			self.record()
  
@@ -68,3 +196,19 @@
  		buf = v4l2.v4l2_buffer()
  		buf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
  		buf.memory = v4l2.V4L2_MEMORY_MMAP
+@@ -273,6 +393,7 @@
+ 		arr = numpy.frombuffer(raw, dtype='<u2')
+ 		arr = arr.reshape(self.height, self.bytesperline // 2)
+ 		arr = arr[:, :self.width]
++		self.ae.update(arr)
+ 		gray = (arr >> 2).astype(numpy.uint8)
+ 
+ 		return True, cvtColor(gray, COLOR_GRAY2BGR)
+@@ -292,6 +413,7 @@
+ 				_set_ir_led(False)
+ 				self.led_on = False
+ 		finally:
++			self.ae.close()
+ 			os.close(self.fd)
+ 			self.fd = None
+ 

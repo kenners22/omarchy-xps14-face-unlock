@@ -20,6 +20,7 @@ Unlocks sudo, polkit (system prompts, 1Password) and the lock screen in about
 |---|---|
 | Tested on | XPS 14 DA14260, Omarchy 4.0.4, kernel `7.2.5-3-omarchy` |
 | IR stream | 648x368 @ ~29 fps on IPU7 CSI2 port 2; flood LED switched by the driver |
+| Sunlight | works: auto-exposure in the IR reader and the warm service (the sensor has none) |
 | Webcam | unaffected (Omarchy's relay at "Hardware ISP Camera") |
 | Not yet tested | IR after suspend/resume; XPS 16 (same chips, should be close) |
 
@@ -44,7 +45,7 @@ Each step uses `sudo` where it needs root, so run it as yourself, and each has
 |---|---|
 | `face-unlock setup` | Installs Howdy (`howdy-git`, AUR), enrolls you, adds `pam_howdy` to sudo, polkit and the lock screen, after checking recognition works. Uses the XPS 14's camera, or your own with `FACE_UNLOCK_CAMERA=/dev/v4l/by-path/...`. |
 | `face-unlock ir` | Takes a bootable snapper snapshot, then installs two DKMS modules from `ir/`. **`hm1092`** is the IR sensor driver from [HritwikSinghal/svp7500-camera-fix-pack](https://github.com/HritwikSinghal/svp7500-camera-fix-pack) `v1.1`, unchanged. **`ipu-bridge-himx`** is Omarchy's exact `ipu-bridge.c` for `7.2.5-3-omarchy` (kernel.org v7.2.5 + linux-omarchy patches `0540`/`0541`; the rebuild matches the shipped module's srcversion) plus the `HIMX1092` entry from mainline `4fdb0342f05e` (in Linux 7.3). |
-| `face-unlock ir-howdy` | Switches Howdy to the IR camera. It downloads the fix pack's raw IR reader for Howdy (pinned commit, sha256-checked) and applies `ir/howdy/ir_reader-fixes.patch`: a frame timeout so a stalled stream can't hang sudo, absolute `media-ctl`, and ignoring size changes. It adds a udev rule giving the logged-in user the IR capture node, which Omarchy's `71-ipu7-hide-isys.rules` makes root-only, then re-enrolls. `--undo` goes back to the webcam. |
+| `face-unlock ir-howdy` | Switches Howdy to the IR camera. It downloads the fix pack's raw IR reader for Howdy (pinned commit, sha256-checked) and applies `ir/howdy/ir_reader-fixes.patch`: a frame timeout so a stalled stream can't hang sudo, absolute `media-ctl`, ignoring size changes, and auto-exposure (see "Sunlight" below). It adds a udev rule giving the logged-in user the IR capture node, which Omarchy's `71-ipu7-hide-isys.rules` makes root-only, then re-enrolls. `--undo` goes back to the webcam. |
 | `face-unlock warm` | Makes it fast (`warm/`). `howdy-warmd` is a root service that keeps the face models loaded and runs Howdy's scan loop with Howdy's config and face models. It is Rust, with Howdy's OpenCV steps (CLAHE, the darkness check, the resize) re-implemented to give OpenCV's results byte for byte, and dlib's C++ library (Arch's `dlib` package, which this step installs) reached through one small C++ file in place of its Python bindings. It reads the IR camera itself, the same way Howdy's IR reader does. `howdy-warm-auth` (Rust, std only) is what PAM runs via `pam_exec` instead of `pam_howdy`. If the service is down, or Howdy is set to a camera other than the IR reader, the client runs stock Howdy, so face unlock still works, just slower. The step builds both, tests them on you, then switches PAM. |
 | `face-unlock lock` | The PAM stack for the patched lock screen in `lock/`: a patch for a **clone** of Omarchy's lock screen (`omarchy plugin clone omarchy.lock`) that adds a face-scan path. When the lock comes up after 20 s without input (idle lock) or after resume, it scans at once. When you lock it yourself (Super+Ctrl+L), it waits for a key or trackpad press, so locking at the desk doesn't unlock straight away. The patched lock screen also looks like Omarchy's boot unlock screen instead of the blurred wallpaper, and follows the style you pick under Style > Unlock in Omarchy's menu (same logo, padlock and colours), with a face icon in the password box. Based on [pb3975/omarchy-face-auth](https://github.com/pb3975/omarchy-face-auth). With the warm service installed, the lock screen goes through it too. |
 
@@ -118,6 +119,18 @@ Setting Howdy's `max_height = 240` (the IR frame is 368 high) saves another
   about its own user (SO_PEERCRED). SSH sessions and a closed lid are refused,
   as with `pam_howdy`. The client ignores environment overrides, so a user
   can't point sudo at a fake service.
+- **Sunlight.** Sunlight is strong in infrared, and the hm1092 driver starts
+  every stream at one fixed exposure (its init table's `0x00b4`). Outdoors that
+  saturated ~95% of the frame and Howdy found no face. Setting `exposure` on the
+  sensor subdev only works mid-stream: `hm1092_set_ctrl()` returns early while
+  not streaming, and stream-on applies the controls before it sets
+  `streaming`. So the IR reader and `howdy-warmd` run their own auto-exposure
+  after `STREAMON`: they aim the centre of the frame at a mean of 300 (10-bit)
+  and cut exposure by 4 when more than 5% of it is saturated. In direct sun it
+  settles within ~10 frames (~0.3 s), and the next scan starts at the last
+  value. A face model enrolled indoors may still not match outdoors (with
+  glasses, the lenses go dark in sunlight). Add a second one outside:
+  `sudo howdy add`.
 - **Face unlock is weaker than a password.** The IR camera rejects photos far
   better than a webcam does, but treat it as a convenience.
 
