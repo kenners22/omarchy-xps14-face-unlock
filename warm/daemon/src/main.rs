@@ -240,9 +240,10 @@ fn scan(warm: &mut Warm, camera: &mut Option<Camera>, user: &str, config: &Confi
             // mean grey level and the LED's state: to tell an unlit scene from a covered camera
             let mean = level_sum as f64 / read_frames.max(1) as f64 / (cam.width * cam.height) as f64;
             log!(
-                "{user}: no match in {timeout}s (frames {frames}, dark {dark_tries}, best {:.2}, mean level {mean:.1}, led {})",
+                "{user}: no match in {timeout}s (frames {frames}, dark {dark_tries}, best {:.2}, mean level {mean:.1}, led {}, exposure {})",
                 lowest * 10.0,
-                camera::ir_led_state()
+                camera::ir_led_state(),
+                cam.exposure().map_or("off".to_string(), |e| e.to_string())
             );
             return if dark_tries == valid_frames { "NO dark" } else { "NO timeout" };
         }
@@ -455,7 +456,8 @@ fn check_frames(args: &[String]) -> ! {
 }
 
 /// `howdy-warmd --camera-test`: open the camera the way a scan does, read a
-/// few frames and report timings, brightness and the LED. No face matching.
+/// few frames and report timings, brightness, exposure and the LED. No face
+/// matching. Twelve frames: enough to see auto-exposure settle from saturation.
 fn camera_test() -> ! {
     let config = Config::load();
     let device = config.get("video", "device_path").unwrap_or("").to_string();
@@ -466,12 +468,13 @@ fn camera_test() -> ! {
     });
     println!("opened {}x{} in {:.0} ms", cam.width, cam.height, t.elapsed().as_secs_f64() * 1000.0);
     let mut gray = Vec::new();
-    for i in 0..5 {
+    for i in 0..12 {
         match cam.read(&mut gray) {
             Some(sum) => println!(
-                "frame {i}: {:.0} ms, mean level {:.1}, led {}",
+                "frame {i}: {:.0} ms, mean level {:.1}, exposure {}, led {}",
                 t.elapsed().as_secs_f64() * 1000.0,
                 sum as f64 / (cam.width * cam.height) as f64,
+                cam.exposure().map_or("off".to_string(), |e| e.to_string()),
                 camera::ir_led_state()
             ),
             None => {
