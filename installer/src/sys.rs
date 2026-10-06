@@ -114,13 +114,21 @@ pub fn sudo_write(path: &str, content: &str) -> Result {
         let _ = ok(&mut sudo(&["rm", "-f", &tmp]));
         bail!("couldn't write {path}");
     }
-    if exists(path) {
-        run(&mut sudo(&["chmod", "--reference", path, &tmp]))?;
-        run(&mut sudo(&["chown", "--reference", path, &tmp]))?;
-    } else {
-        run(&mut sudo(&["chmod", "0644", &tmp]))?;
+    let finish = || -> Result {
+        if exists(path) {
+            run(&mut sudo(&["chmod", "--reference", path, &tmp]))?;
+            run(&mut sudo(&["chown", "--reference", path, &tmp]))?;
+        } else {
+            run(&mut sudo(&["chmod", "0644", &tmp]))?;
+        }
+        run(&mut sudo(&["mv", "-f", &tmp, path]))
+    };
+    let res = finish();
+    if res.is_err() {
+        // never leave the temporary file behind
+        let _ = ok(&mut sudo(&["rm", "-f", &tmp]));
     }
-    run(&mut sudo(&["mv", "-f", &tmp, path]))
+    res
 }
 
 /// `sudo cp -a FILE FILE.bak.<stamp>`, if FILE exists.

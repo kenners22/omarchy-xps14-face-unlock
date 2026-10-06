@@ -21,7 +21,11 @@
 //! Policy: a non-root caller may only ask about its own user (SO_PEERCRED), so
 //! a local process can't use this to check someone else's face. Callers inside
 //! an SSH session are refused, and nothing scans with the lid shut -- the same
-//! abort_if_ssh / abort_if_lid_closed rules pam_howdy applies.
+//! abort_if_ssh / abort_if_lid_closed rules pam_howdy applies. This goes
+//! further than pam_howdy: while logind has any remote session open for the
+//! user (or root), face unlock is off for that user everywhere, at the desk
+//! too, and the password is asked instead. Like pam_howdy, it can't tell a
+//! user service planted over an earlier SSH login from a local one.
 
 mod camera;
 mod config;
@@ -103,7 +107,12 @@ fn lid_closed() -> bool {
 /// ancestor vanished mid-walk), it counts as SSH.
 fn in_ssh_session(mut pid: i32) -> bool {
     for _ in 0..64 {
-        if pid <= 1 {
+        // pid 0: the caller is in another pid namespace (a container), so its
+        // ancestry can't be checked. 1: the walk reached init.
+        if pid <= 0 {
+            return true;
+        }
+        if pid == 1 {
             return false;
         }
         let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else { return true };
@@ -445,10 +454,41 @@ fn check_frames(args: &[String]) -> ! {
     process::exit(0)
 }
 
+/// `howdy-warmd --camera-test`: open the camera the way a scan does, read a
+/// few frames and report timings, brightness and the LED. No face matching.
+fn camera_test() -> ! {
+    let config = Config::load();
+    let device = config.get("video", "device_path").unwrap_or("").to_string();
+    let t = Instant::now();
+    let mut cam = Camera::open(&device).unwrap_or_else(|e| {
+        eprintln!("camera {device}: {e}");
+        process::exit(1)
+    });
+    println!("opened {}x{} in {:.0} ms", cam.width, cam.height, t.elapsed().as_secs_f64() * 1000.0);
+    let mut gray = Vec::new();
+    for i in 0..5 {
+        match cam.read(&mut gray) {
+            Some(sum) => println!(
+                "frame {i}: {:.0} ms, mean level {:.1}, led {}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                sum as f64 / (cam.width * cam.height) as f64,
+                camera::ir_led_state()
+            ),
+            None => {
+                println!("frame {i}: read failed");
+                process::exit(1)
+            }
+        }
+    }
+    process::exit(0)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--frames") {
-        check_frames(&args[2..]);
+    match args.get(1).map(String::as_str) {
+        Some("--frames") => check_frames(&args[2..]),
+        Some("--camera-test") => camera_test(),
+        _ => {}
     }
 
     // The override is for testing the service as a normal user; the client
@@ -514,6 +554,8 @@ struct Slots {
 
 const MAX_REQUESTS: usize = 16;
 const MAX_REQUESTS_PER_UID: usize = 2;
+/// Root is PAM itself (sudo, polkit), so it may have a few more in flight.
+const MAX_REQUESTS_ROOT: usize = 4;
 
 /// One open request; frees its place when dropped.
 struct Slot {
@@ -525,11 +567,11 @@ impl Slots {
     fn take(slots: &Arc<Slots>, uid: u32) -> Option<Slot> {
         let mut per_uid = slots.per_uid.lock().unwrap_or_else(|e| e.into_inner());
         let total: usize = per_uid.values().sum();
-        let mine = per_uid.entry(uid).or_insert(0);
-        if total >= MAX_REQUESTS || *mine >= MAX_REQUESTS_PER_UID {
+        let limit = if uid == 0 { MAX_REQUESTS_ROOT } else { MAX_REQUESTS_PER_UID };
+        if total >= MAX_REQUESTS || per_uid.get(&uid).copied().unwrap_or(0) >= limit {
             return None;
         }
-        *mine += 1;
+        *per_uid.entry(uid).or_insert(0) += 1;
         Some(Slot { slots: slots.clone(), uid })
     }
 }

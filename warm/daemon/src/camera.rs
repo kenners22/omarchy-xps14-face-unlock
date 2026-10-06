@@ -115,16 +115,24 @@ pub fn ir_led_state() -> String {
 
 // --- media graph (ir_reader.configure_pipeline) -----------------------------
 
-/// Run media-ctl and return its stdout, killing it after 3 s as Howdy's IR
-/// reader does: a hung IPU7 ioctl must not hold the camera lock forever.
-fn media_ctl(args: &[&str]) -> Option<String> {
-    let mut child = Command::new(MEDIA_CTL)
+/// media-ctl didn't finish within MEDIA_CTL_TIMEOUT: the media driver is hung.
+#[derive(Debug)]
+pub struct Hung;
+
+/// Run media-ctl and return its stdout (None if it couldn't run or failed),
+/// killing it after 3 s as Howdy's IR reader does. A hung IPU7 ioctl can leave
+/// it unkillable, so it is reaped on a thread of its own: the scan never
+/// blocks on it, and gives up with Hung instead.
+fn media_ctl(args: &[&str]) -> Result<Option<String>, Hung> {
+    let Ok(mut child) = Command::new(MEDIA_CTL)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
+    else {
+        return Ok(None);
+    };
+    let Some(mut stdout) = child.stdout.take() else { return Ok(None) };
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = std::io::Read::read_to_string(&mut stdout, &mut s);
@@ -133,19 +141,21 @@ fn media_ctl(args: &[&str]) -> Option<String> {
     let deadline = std::time::Instant::now() + MEDIA_CTL_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return reader.join().ok(),
+            Ok(Some(status)) => return Ok(reader.join().ok().filter(|_| status.success())),
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(Hung);
             }
         }
     }
 }
 
-fn topology(dev: &str) -> String {
-    media_ctl(&["-d", dev, "-p"]).unwrap_or_default()
+fn topology(dev: &str) -> Result<String, Hung> {
+    Ok(media_ctl(&["-d", dev, "-p"])?.unwrap_or_default())
 }
 
 /// "- entity 12: name (1 pad, ...)" -> "name"
@@ -181,17 +191,17 @@ fn link_from<'a>(topo: &'a str, entity: &str, want: &str) -> Option<&'a str> {
 
 /// Set the pad formats and enable the CSI2 -> capture link, then return the
 /// capture node. Everything is found by entity name: the /dev numbers move
-/// between boots.
-pub fn configure_pipeline() -> Option<String> {
-    let mut devs: Vec<String> = std::fs::read_dir("/dev")
-        .ok()?
+/// between boots. Hung if media-ctl stops answering.
+pub fn configure_pipeline() -> Result<Option<String>, Hung> {
+    let Ok(dir) = std::fs::read_dir("/dev") else { return Ok(None) };
+    let mut devs: Vec<String> = dir
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| n.starts_with("media"))
         .map(|n| format!("/dev/{n}"))
         .collect();
     devs.sort();
     for dev in devs {
-        let topo = topology(&dev);
+        let topo = topology(&dev)?;
         if !topo.contains(SENSOR_ENTITY) {
             continue;
         }
@@ -206,20 +216,20 @@ pub fn configure_pipeline() -> Option<String> {
             ["--set-v4l2".to_string(), format!("\"{csi2}\":1 [fmt:{FMT}]")],
             ["-l".to_string(), format!("\"{csi2}\":1 -> \"{cap}\":0 [1]")],
         ] {
-            media_ctl(&["-d", &dev, &args[0], &args[1]]);
+            media_ctl(&["-d", &dev, &args[0], &args[1]])?;
         }
         let mut ent = None;
-        for line in topology(&dev).lines() {
+        for line in topology(&dev)?.lines() {
             if let Some(name) = entity_name(line) {
                 ent = Some(name.to_string());
             }
             if line.contains("device node name /dev/video") && ent.as_deref() == Some(cap) {
-                return line.split_whitespace().last().map(String::from);
+                return Ok(line.split_whitespace().last().map(String::from));
             }
         }
-        return None;
+        return Ok(None);
     }
-    None
+    Ok(None)
 }
 
 // --- capture ----------------------------------------------------------------
@@ -237,7 +247,11 @@ pub struct Camera {
 impl Camera {
     /// `device` is config.ini's device_path; the media graph wins if it disagrees.
     pub fn open(device: &str) -> std::io::Result<Camera> {
-        let device = configure_pipeline().unwrap_or_else(|| device.to_string());
+        // A hung media driver: give up now (the scan answers NO error and frees
+        // the camera lock) rather than open a node that would hang too
+        let device = configure_pipeline()
+            .map_err(|Hung| std::io::Error::other("media-ctl hung (IPU7 media driver not answering)"))?
+            .unwrap_or_else(|| device.to_string());
         let file = OpenOptions::new().read(true).write(true).open(&device)?;
         let fd = file.as_raw_fd();
 
