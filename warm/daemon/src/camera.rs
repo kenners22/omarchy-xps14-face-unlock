@@ -232,6 +232,120 @@ pub fn configure_pipeline() -> Result<Option<String>, Hung> {
     Ok(None)
 }
 
+// --- auto-exposure (ir_reader-fixes.patch's _AutoExposure) --------------------
+//
+// The sensor has none, and the driver starts every stream at its init table's
+// exposure (0x00b4), which saturates ~95% of the frame in sunlight.
+// hm1092_set_ctrl() drops controls while not streaming -- including the ones
+// stream-on applies -- so exposure can only be changed after STREAMON, and
+// lands about two frames later.
+
+const VIDIOC_G_CTRL: u64 = 0xc008_561b;
+const VIDIOC_S_CTRL: u64 = 0xc008_561c;
+const CID_EXPOSURE: u32 = 0x0098_0911;
+const EXP_MIN: i32 = 2;
+const EXP_MAX: i32 = 720;
+/// Mean of the centre of the frame (where the face is) to aim for, 10-bit,
+/// and how far off it may be before exposure is touched.
+const AE_TARGET: f64 = 300.0;
+const AE_BAND: f64 = 0.25;
+/// Share of saturated centre pixels that means "far too bright": cut by 4.
+const AE_SATURATED: f64 = 0.05;
+/// Frames to wait after a change before judging again.
+const AE_SETTLE: u32 = 2;
+
+#[repr(C)]
+struct Control {
+    id: u32,
+    value: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<Control>() == 8);
+
+/// The sensor's /dev/v4l-subdevN, by name from sysfs.
+fn sensor_subdev() -> Option<String> {
+    let mut nodes: Vec<String> = std::fs::read_dir("/sys/class/video4linux")
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("v4l-subdev"))
+        .collect();
+    nodes.sort();
+    nodes
+        .into_iter()
+        .find(|n| std::fs::read_to_string(format!("/sys/class/video4linux/{n}/name")).is_ok_and(|s| s.starts_with(SENSOR_ENTITY)))
+        .map(|n| format!("/dev/{n}"))
+}
+
+/// The exposure to switch to after a frame whose centre has mean `mean`
+/// (10-bit) and `saturated` share of pixels at 1000 or more; None to leave it.
+fn next_exposure(exp: i32, mean: f64, saturated: f64) -> Option<i32> {
+    let new = if saturated > AE_SATURATED {
+        exp / 4
+    } else if (mean - AE_TARGET).abs() <= AE_TARGET * AE_BAND {
+        return None;
+    } else {
+        (exp as f64 * AE_TARGET / mean.max(1.0)).round() as i32
+    };
+    let new = new.clamp(EXP_MIN, EXP_MAX);
+    (new != exp).then_some(new)
+}
+
+/// Mean and saturated share of the centre of a raw frame (16-bit LE containers).
+fn centre_stats(raw: &[u8], bytesperline: usize, width: usize, height: usize) -> (f64, f64) {
+    let (mut sum, mut saturated, mut n) = (0u64, 0u64, 0u64);
+    for row in raw.chunks_exact(bytesperline).take(height * 5 / 6).skip(height / 6) {
+        for p in row[width / 4 * 2..width * 3 / 4 * 2].as_chunks::<2>().0 {
+            let v = u16::from_le_bytes(*p);
+            sum += v as u64;
+            saturated += (v >= 1000) as u64;
+            n += 1;
+        }
+    }
+    let n = n.max(1) as f64;
+    (sum as f64 / n, saturated as f64 / n)
+}
+
+struct AutoExposure {
+    subdev: File,
+    exp: i32,
+    settle: u32,
+}
+
+impl AutoExposure {
+    fn set(&self, value: i32) -> std::io::Result<()> {
+        ioctl(self.subdev.as_raw_fd(), VIDIOC_S_CTRL, &mut Control { id: CID_EXPOSURE, value })
+    }
+
+    /// After STREAMON: re-apply the last exposure the control holds, so a scan
+    /// starts where the previous one converged. V4L2 skips a write of the
+    /// cached value, so step off it and back to make the driver write it.
+    fn start(subdev: File) -> Option<AutoExposure> {
+        let mut ctrl = Control { id: CID_EXPOSURE, value: 0 };
+        ioctl(subdev.as_raw_fd(), VIDIOC_G_CTRL, &mut ctrl).ok()?;
+        let exp = ctrl.value.clamp(EXP_MIN, EXP_MAX);
+        let ae = AutoExposure { subdev, exp, settle: AE_SETTLE };
+        ae.set(if exp < EXP_MAX { exp + 1 } else { exp - 1 }).ok()?;
+        ae.set(exp).ok()?;
+        Some(ae)
+    }
+
+    /// Judge one raw frame and adjust exposure. False if the control failed.
+    fn update(&mut self, raw: &[u8], bytesperline: usize, width: usize, height: usize) -> bool {
+        if self.settle > 0 {
+            self.settle -= 1;
+            return true;
+        }
+        let (mean, saturated) = centre_stats(raw, bytesperline, width, height);
+        let Some(new) = next_exposure(self.exp, mean, saturated) else { return true };
+        if self.set(new).is_err() {
+            return false;
+        }
+        self.exp = new;
+        self.settle = AE_SETTLE;
+        true
+    }
+}
+
 // --- capture ----------------------------------------------------------------
 
 pub struct Camera {
@@ -242,6 +356,11 @@ pub struct Camera {
     pub width: usize,
     pub height: usize,
     bytesperline: usize,
+    /// The sensor subdev, until streaming starts and auto-exposure takes it.
+    subdev: Option<File>,
+    /// Off when the subdev is missing or a control write fails: capture carries
+    /// on at the driver's exposure.
+    ae: Option<AutoExposure>,
 }
 
 impl Camera {
@@ -278,7 +397,9 @@ impl Camera {
         let mut req = RequestBuffers { count: NBUF, typ: BUF_TYPE_VIDEO_CAPTURE, memory: MEMORY_MMAP, ..Default::default() };
         ioctl(fd, VIDIOC_REQBUFS, &mut req)?;
 
-        let mut cam = Camera { file, buffers: Vec::new(), streaming: false, led_on: false, width, height, bytesperline };
+        let subdev = sensor_subdev().and_then(|n| OpenOptions::new().read(true).write(true).open(n).ok());
+        let mut cam =
+            Camera { file, buffers: Vec::new(), streaming: false, led_on: false, width, height, bytesperline, subdev, ae: None };
         for i in 0..req.count {
             let mut buf = Buffer { index: i, typ: BUF_TYPE_VIDEO_CAPTURE, memory: MEMORY_MMAP, ..Default::default() };
             ioctl(fd, VIDIOC_QUERYBUF, &mut buf)?;
@@ -307,7 +428,13 @@ impl Camera {
         let mut typ = BUF_TYPE_VIDEO_CAPTURE as i32;
         ioctl(self.file.as_raw_fd(), VIDIOC_STREAMON, &mut typ)?;
         self.streaming = true;
+        self.ae = self.subdev.take().and_then(AutoExposure::start);
         Ok(())
+    }
+
+    /// The exposure auto-exposure last set, if it is running.
+    pub fn exposure(&self) -> Option<i32> {
+        self.ae.as_ref().map(|ae| ae.exp)
     }
 
     /// The next frame as 8-bit grey (width x height, no padding) into `out`;
@@ -330,6 +457,10 @@ impl Camera {
         let mut sum = 0u64;
         if len >= need {
             let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, need) };
+            let (bpl, w, h) = (self.bytesperline, self.width, self.height);
+            if self.ae.as_mut().is_some_and(|ae| !ae.update(raw, bpl, w, h)) {
+                self.ae = None;
+            }
             out.clear();
             out.reserve(self.width * self.height);
             for row in raw.chunks_exact(self.bytesperline) {
@@ -384,6 +515,36 @@ mod tests {
 	pad0: Source
 		-> "Intel IPU7 CSI2 2":0 [ENABLED,IMMUTABLE]
 "#;
+
+    #[test]
+    fn exposure_steps() {
+        // saturated: cut by 4, never below the minimum
+        assert_eq!(next_exposure(256, 1019.0, 0.97), Some(64));
+        assert_eq!(next_exposure(4, 1019.0, 0.97), Some(EXP_MIN));
+        assert_eq!(next_exposure(EXP_MIN, 1019.0, 0.97), None);
+        // inside the band: leave it
+        assert_eq!(next_exposure(24, 280.0, 0.0), None);
+        // outside: scale towards the target, within limits
+        assert_eq!(next_exposure(16, 198.0, 0.0), Some(24));
+        assert_eq!(next_exposure(600, 10.0, 0.0), Some(EXP_MAX));
+        assert_eq!(next_exposure(EXP_MAX, 10.0, 0.0), None);
+    }
+
+    #[test]
+    fn centre_of_a_padded_frame() {
+        // 8x6 frame, stride 10 pixels; centre is rows 1..5, columns 2..6
+        let (w, h, bpl) = (8, 6, 20);
+        let mut raw = vec![0u8; bpl * h];
+        for y in 0..h {
+            for x in 0..bpl / 2 {
+                let v: u16 = if (1..5).contains(&y) && (2..6).contains(&x) { if x == 2 { 1023 } else { 300 } } else { 7 };
+                raw[y * bpl + x * 2..][..2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let (mean, sat) = centre_stats(&raw, bpl, w, h);
+        assert_eq!(mean, (1023.0 + 3.0 * 300.0) / 4.0);
+        assert_eq!(sat, 0.25);
+    }
 
     #[test]
     fn follows_the_media_graph() {
