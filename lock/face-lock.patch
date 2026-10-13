@@ -611,7 +611,7 @@
      id: strandedLockCheckProc
      command: ["bash", "-c", "omarchy-hyprland-session-locked"]
      onExited: function(exitCode) {
-@@ -411,6 +588,33 @@
+@@ -411,6 +588,36 @@
      command: ["bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]
    }
  
@@ -637,6 +637,9 @@
 +      if (lastTick > 0 && now - lastTick > 10000) {
 +        root.logEvent("face: scan after resume")
 +        root.rearmFace()
++        // The bar clock's minute timer was frozen by suspend too, so it would
++        // show last night's time for up to a minute after a fast face unlock.
++        Quickshell.execDetached(["omarchy-shell", "-q", "omarchy.clock", "refresh"])
 +      }
 +      lastTick = now
 +    }
@@ -645,7 +648,7 @@
    Timer {
      id: idleBlankTimer
      interval: 5000
-@@ -504,6 +708,7 @@
+@@ -504,6 +711,7 @@
    Component.onCompleted: {
      refreshBackground()
      refreshFingerprintStatus()
@@ -653,7 +656,7 @@
      checkStrandedLock()
    }
  
-@@ -530,6 +735,8 @@
+@@ -530,6 +738,8 @@
          realScreens: root.realScreenCount(),
          passwordPam: root.passwordPamConfigured,
          fingerprint: root.fingerprintConfigured,
@@ -662,7 +665,7 @@
          authenticating: root.authenticating,
          lastEvent: root.lastEvent,
          lastEventAt: root.lastEventAt
-@@ -539,6 +746,7 @@
+@@ -539,6 +749,7 @@
      function preview(): string {
        root.refreshBackground()
        root.refreshFingerprintStatus()
