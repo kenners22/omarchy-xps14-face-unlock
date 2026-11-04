@@ -10,7 +10,8 @@
 # background and text colour, re-read on every lock. Pixel-art logos are drawn
 # at exactly 2x with smoothing off, so they stay sharp on HiDPI screens.
 #
-# Made against Omarchy 4.0.4's lock plugin (checksums in lock/UPSTREAM_SHA256).
+# Made against Omarchy 4.5.0's lock plugin (checksums in lock/UPSTREAM_SHA256).
+# For Omarchy 4.0.x, use the copy of this file in commit 220e1c8.
 # Apply to a clone, never to /usr/share/omarchy:
 #
 #   omarchy plugin clone omarchy.lock          # creates ~/.config/omarchy/plugins/$USER.lock
@@ -24,21 +25,28 @@
  import QtQuick.Effects
 +import QtQuick.Window
  import qs.Commons
+ import qs.Commons as Commons
  import qs.Ui
+@@ -8,10 +9,14 @@
+   id: root
  
-@@ -9,6 +10,8 @@
    property string backgroundPath: ""
+-  property string videoPosterPath: ""
    property int backgroundVersion: 0
    property bool fingerprintConfigured: false
+   property bool fingerprintUnavailable: false
++  // Omarchy 4.5 passes a video wallpaper's still; unused here, since this lock
++  // shows the boot screen's style instead of the wallpaper.
++  property string videoPosterPath: ""
 +  property bool faceConfigured: false
 +  property bool faceAuthenticating: false
    property bool authenticatingPassword: false
    property string failureMessage: ""
    property int failedAttempts: 0
-@@ -18,8 +21,27 @@
+@@ -21,8 +26,27 @@
    property bool syncingPasswordText: false
  
-   readonly property string placeholderText: "Enter Password"
+   readonly property string placeholderText: Commons.I18n.t("lock.enterPassword")
 -  readonly property int fieldWidth: 381
 -  readonly property int fieldHeight: 67
 +  // Mirrors Omarchy's boot unlock screen (the Plymouth theme), whose style is
@@ -49,9 +57,9 @@
 +  property string defaultLogoPath: ""
 +  property string styleBackground: ""
 +  property string styleText: ""
-+  readonly property color backgroundColor: styleBackground || Color.background
-+  readonly property color textColor: styleText || Color.lock.text
-+  readonly property color placeholderColor: styleText ? Qt.alpha(styleText, 0.66) : Color.lock.placeholder
++  readonly property color backgroundColor: styleBackground || Commons.Color.background
++  readonly property color textColor: styleText || Commons.Color.lock.text
++  readonly property color placeholderColor: styleText ? Qt.alpha(styleText, 0.66) : Commons.Color.lock.placeholder
 +  // Never wider than 800, nor than most of a narrow (e.g. portrait) screen.
 +  readonly property int maxLogoWidth: Math.min(800, Math.floor(width * 0.85))
 +  // The logo is centred, so its lower half plus the field and margins must fit
@@ -65,7 +73,7 @@
    readonly property int outlineThickness: 3
    readonly property int fieldFontSize: Math.round(Style.font.heading * 1.125)
    readonly property int passwordDotFontSize: Math.round(Style.font.heading * 1.33)
-@@ -27,6 +49,9 @@
+@@ -30,6 +54,9 @@
    // Space to keep clear on each side of the field for the fingerprint icon
    // (icon width plus a gap) so the centered dots never run under it.
    readonly property real fingerprintReserve: fingerprintConfigured ? Math.round(fingerprintIcon.implicitWidth + 12) : 0
@@ -75,13 +83,15 @@
    // Shrink the dots to fit once the password outgrows the field, so every
    // keystroke stays visible — otherwise long passwords clip with no feedback.
    readonly property real passwordDotScale: dotMetrics.advanceWidth > 0
-@@ -36,12 +61,20 @@
+@@ -39,15 +66,29 @@
    readonly property bool errorState: failureMessage.length > 0
    readonly property var inputBorderSpec: errorState
-     ? Border.surfaceSpec("lock", "border-error", Color.lock.borderError, root.outlineThickness, "border-alpha")
--    : Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha")
-+    : styleBorderSpec(Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha"))
-+
+     ? Border.surfaceSpec("lock", "border-error", Commons.Color.lock.borderError, root.outlineThickness, "border-alpha")
+-    : Border.surfaceSpec("lock", "border-active", Commons.Color.lock.borderActive, root.outlineThickness, "border-alpha")
++    : styleBorderSpec(Border.surfaceSpec("lock", "border-active", Commons.Color.lock.borderActive, root.outlineThickness, "border-alpha"))
+ 
+-  // A video wallpaper shows its still poster: nothing plays behind the lock.
+-  readonly property bool video: Util.isVideoPath(root.backgroundPath)
 +  // The boot screen draws its field outline in the style's text colour.
 +  function styleBorderSpec(spec) {
 +    if (!styleText) return spec
@@ -95,26 +105,43 @@
 +  // pointerOnly: plain pointer movement, which the lock surface appearing
 +  // under the cursor can fake; keys, clicks and taps pass false.
 +  signal wakeRequested(bool pointerOnly)
++
++  // Cache-busts the lock background by appending `?v=`. Adding a query
++  // string keeps Image's loader happy while forcing it to reload when the
++  // user picks a new background mid-session.
++  function fileUrl(path) {
++    if (!path) return ""
++    var encoded = String(path).split("/").map(encodeURIComponent).join("/")
++    return "file://" + encoded + "?v=" + backgroundVersion
++  }
  
-   // Cache-busts the lock background by appending `?v=`. Adding a query
-   // string keeps Image's loader happy while forcing it to reload when the
-@@ -88,43 +121,65 @@
+   function forcePasswordFocus() {
+     passwordInput.forceActiveFocus()
+@@ -104,47 +145,65 @@
  
    Rectangle {
      anchors.fill: parent
--    color: Color.background
+-    color: Commons.Color.background
 +    color: root.backgroundColor
  
+-    BackgroundMedia {
+-      id: wallpaper
+-      objectName: "lockWallpaper"
+-      anchors.fill: parent
+-      path: root.loadBackground ? (root.video ? root.videoPosterPath : root.backgroundPath) : ""
+-      version: root.backgroundVersion
+-      // Decode only once sized, at the lock's own size: an unsized first
+-      // request decoded the file at its native resolution, then again once
+-      // sized. That size is what the lock service keeps decoded ahead of the
+-      // lock, so the first frame has the wallpaper.
+-      cached: true
+-      constrainDecode: true
+-      decodeSize: Qt.size(width, height)
 +    // Most unlock logos are pixel art, 800 wide. At their own size on a 1x or
 +    // 2x screen they land on whole screen pixels, so smoothing stays off and
 +    // every edge stays sharp; a logo shrunk to fit, or on a fractional scale,
 +    // gets smoothed.
-     Image {
--      id: wallpaper
--      anchors.fill: parent
--      source: root.loadBackground ? root.fileUrl(root.backgroundPath) : ""
--      fillMode: Image.PreserveAspectCrop
--      asynchronous: true
++    Image {
 +      id: logo
 +      property bool useDefault: false
 +      readonly property real fit: implicitWidth > 0 && implicitHeight > 0
@@ -122,9 +149,7 @@
 +        : 1
 +      readonly property bool shrunk: fit < 1
 +      source: root.fileUrl(useDefault || !root.unlockStyleDir ? root.defaultLogoPath : root.unlockStyleDir + "/logo.png")
-       cache: false
--      sourceSize.width: width
--      sourceSize.height: height
++      cache: false
 +      anchors.centerIn: parent
 +      width: Math.round(implicitWidth * fit)
 +      height: Math.round(implicitHeight * fit)
@@ -143,7 +168,7 @@
 -      anchors.fill: wallpaper
 -      source: wallpaper
 -      autoPaddingEnabled: false
--      blurEnabled: root.loadBackground && wallpaper.status === Image.Ready
+-      blurEnabled: root.loadBackground && wallpaper.ready
 -      blur: 1.0
 -      blurMax: 128
 -      blurMultiplier: 1.25
@@ -177,7 +202,7 @@
        width: root.fieldWidth
        height: root.fieldHeight
 -      anchors.centerIn: parent
--      color: Color.lock.background
+-      color: Commons.Color.lock.background
 +      anchors.horizontalCenter: parent.horizontalCenter
 +      anchors.top: logo.bottom
 +      anchors.topMargin: 40
@@ -185,7 +210,7 @@
        borderSpec: root.inputBorderSpec
        radius: Style.cornerRadius
        clip: true
-@@ -133,11 +188,11 @@
+@@ -153,11 +212,11 @@
          id: passwordInput
          anchors.fill: parent
          anchors.topMargin: inputField.borderTop
@@ -201,20 +226,20 @@
          verticalAlignment: TextInput.AlignVCenter
          horizontalAlignment: TextInput.AlignHCenter
          activeFocusOnPress: true
-@@ -147,7 +202,7 @@
+@@ -167,7 +226,7 @@
          echoMode: TextInput.Password
          passwordCharacter: "\u25CF"
          passwordMaskDelay: 0
--        color: Color.lock.text
+-        color: Commons.Color.lock.text
 +        color: root.textColor
-         selectionColor: Color.lock.selection
-         selectedTextColor: Color.lock.text
+         selectionColor: Commons.Color.lock.selection
+         selectedTextColor: Commons.Color.lock.text
          font.family: Style.font.family
-@@ -156,14 +211,14 @@
+@@ -176,14 +235,14 @@
          cursorVisible: activeFocus && root.showPasswordCursor && text.length > 0
          cursorDelegate: Rectangle {
            width: 2
--          color: Color.lock.text
+-          color: Commons.Color.lock.text
 +          color: root.textColor
            visible: passwordInput.cursorVisible
          }
@@ -227,30 +252,30 @@
            }
            if (text.length > 0 && root.failureMessage.length > 0) root.clearFailureRequested()
          }
-@@ -175,7 +230,7 @@
+@@ -195,7 +254,7 @@
          }
  
          Keys.onPressed: function(event) {
 -          root.wakeRequested()
 +          root.wakeRequested(false)
-           if (event.key === Qt.Key_Escape || (event.modifiers & Qt.ControlModifier && event.key === Qt.Key_U)) {
-             root.passwordTextEdited("")
+           if (event.isAutoRepeat && root.dropsAutoRepeat(event.key)) {
              event.accepted = true
-@@ -188,7 +243,7 @@
+             return
+@@ -212,7 +271,7 @@
          anchors.fill: passwordInput
-         text: root.authenticatingPassword ? "Checking…" : (root.failureMessage.length > 0 ? root.failureMessage : root.placeholderText)
+         text: root.authenticatingPassword ? Commons.I18n.t("lock.checking") : (root.failureMessage.length > 0 ? root.failureMessage : root.placeholderText)
          visible: passwordInput.text.length === 0
--        color: root.authenticatingPassword ? Color.lock.text : (root.failureMessage.length > 0 ? Color.lock.textError : Color.lock.placeholder)
-+        color: root.authenticatingPassword ? root.textColor : (root.failureMessage.length > 0 ? Color.lock.textError : root.placeholderColor)
+-        color: root.authenticatingPassword ? Commons.Color.lock.text : (root.failureMessage.length > 0 ? Commons.Color.lock.textError : Commons.Color.lock.placeholder)
++        color: root.authenticatingPassword ? root.textColor : (root.failureMessage.length > 0 ? Commons.Color.lock.textError : root.placeholderColor)
          font.family: Style.font.family
          font.pixelSize: root.fieldFontSize
          font.italic: !root.authenticatingPassword && root.failureMessage.length > 0
-@@ -208,7 +263,28 @@
+@@ -235,7 +294,28 @@
          anchors.verticalCenter: parent.verticalCenter
          visible: root.fingerprintConfigured
-         text: "󰈷"
--        color: Color.lock.placeholder
-+        color: root.placeholderColor
+         text: root.fingerprintUnavailable ? "󰺱" : "󰈷"
+-        color: root.fingerprintUnavailable ? Commons.Color.lock.textError : Commons.Color.lock.placeholder
++        color: root.fingerprintUnavailable ? Commons.Color.lock.textError : root.placeholderColor
 +        font.family: Style.font.family
 +        font.pixelSize: Math.round(root.fieldFontSize * 1.1)
 +        horizontalAlignment: Text.AlignHCenter
@@ -277,7 +302,7 @@
          horizontalAlignment: Text.AlignHCenter
 --- a/Service.qml
 +++ b/Service.qml
-@@ -15,13 +15,39 @@
+@@ -17,13 +17,39 @@
    readonly property string stateHome: home + "/.local/state"
    readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME")
    readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
@@ -314,22 +339,27 @@
 +  property int faceAttempts: 0
 +  property bool faceWaitingForWake: false
 +  property double lockStartedAt: 0
-   property bool previewVisible: false
-   property string enteredPassword: ""
-   property string pendingPassword: ""
-@@ -33,9 +59,10 @@
-   property string lastEventAt: ""
+   property int fingerprintUnreachedStreak: 0
+   property bool fingerprintAttemptReachedDevice: false
+   property bool fingerprintAttemptFastError: false
+@@ -61,6 +87,7 @@
+   readonly property bool videoBackground: Util.isVideoPath(backgroundPath)
    property bool strandedLock: false
    property bool strandedLockResolved: false
 +  property bool displayBlanked: false
  
    readonly property bool locked: lockRequested || sessionLock.locked || sessionLock.secure
+ 
+@@ -70,7 +97,7 @@
+   function currentlyLocked() {
+     return lockRequested || sessionLock.locked || sessionLock.secure
+   }
 -  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating
 +  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating || faceAuthenticating
+   // A prompt clears the unavailable notice before the attempt finishes.
+   readonly property bool fingerprintUnavailable: FingerprintModel.isUnavailable(fingerprintProbeStreak) || (fingerprintConfigured && (!fingerprintAttemptReachedDevice || fingerprintAttemptFastError) && FingerprintModel.isUnavailable(fingerprintUnreachedStreak))
  
-   function realScreenCount() {
-     var screens = Quickshell.screens || []
-@@ -100,13 +127,21 @@
+@@ -140,7 +167,11 @@
    }
  
    function refreshBackground() {
@@ -340,7 +370,8 @@
 +    if (!unlockStyleProc.running) unlockStyleProc.running = true
    }
  
-   function refreshFingerprintStatus() {
+   function refreshPoster() {
+@@ -157,6 +188,10 @@
      if (!fingerprintCheckProc.running) fingerprintCheckProc.running = true
    }
  
@@ -348,25 +379,30 @@
 +    if (!faceCheckProc.running) faceCheckProc.running = true
 +  }
 +
-   function logEvent(event) {
-     lastEvent = event
-     lastEventAt = new Date().toISOString()
-@@ -120,9 +155,14 @@
+   // Only definitive enrollment results may disable authentication.
+   function applyFingerprintProbe(text) {
+     var status = FingerprintModel.classifyProbe(text)
+@@ -197,6 +232,11 @@
      failedAttempts = 0
      authenticatingPassword = false
      fingerprintAuthenticating = false
 +    faceAuthenticating = false
 +    faceAttempts = 0
 +    faceWaitingForWake = false
-     fingerprintRetryTimer.stop()
++    fingerprintRetryTimer.stop()
 +    faceRetryTimer.stop()
+     fingerprintUnreachedStreak = 0
+     fingerprintAttemptFastError = false
+     fingerprintAttemptPromptedAtMs = 0
+@@ -212,6 +252,7 @@
+     fingerprintResumeTimer.stop()
      if (passwordPam.active) passwordPam.abort()
      if (fingerprintPam.active) fingerprintPam.abort()
 +    if (facePam.active) facePam.abort()
    }
  
    function beginLock() {
-@@ -133,6 +173,9 @@
+@@ -222,6 +263,9 @@
  
      resetAuthenticationState()
      lockRequested = true
@@ -376,7 +412,7 @@
      armBlankTimer()
      logEvent("lock-requested")
      queueSessionLock()
-@@ -140,6 +183,7 @@
+@@ -229,6 +273,7 @@
      Qt.callLater(function() {
        root.refreshBackground()
        root.refreshFingerprintStatus()
@@ -384,7 +420,7 @@
      })
  
      return true
-@@ -164,12 +208,23 @@
+@@ -254,11 +299,21 @@
      idleBlankTimer.restart()
    }
  
@@ -400,16 +436,22 @@
 +
      if (!wakeProcess.running) wakeProcess.running = true
      if (lockRequested) armBlankTimer()
+     resumeFingerprint()
+     nudgeFingerprint()
 +    var firstWake = faceWaitingForWake && (!pointerOnly || Date.now() - lockStartedAt >= faceWakeGraceMs)
 +    if (wasBlanked || firstWake) rearmFace()
    }
  
-   function runBlank() {
-+    displayBlanked = true
-     if (!blankProcess.running) blankProcess.running = true
+   // An attempt already running is left to finish under its own timeouts, so
+@@ -349,6 +404,7 @@
    }
  
-@@ -177,10 +232,13 @@
+   function runBlank() {
++    displayBlanked = true
+     pauseFingerprint()
+     if (!blankProcess.running) blankProcess.running = true
+   }
+@@ -357,10 +413,13 @@
      var password = String(value || "")
      if (!lockRequested || authenticatingPassword || password.length === 0) return
  
@@ -424,16 +466,16 @@
  
      if (!passwordPam.start()) {
        handlePasswordFailure()
-@@ -204,6 +262,8 @@
+@@ -384,6 +443,8 @@
      failedAttempts += 1
-     failureMessage = "Authentication failed (" + failedAttempts + ")"
+     failureMessage = I18n.t("lock.authenticationFailed").arg(I18n.formatNumber(failedAttempts))
      runWake()
 +    // Face tries held back during the check pick up where they left off.
 +    if (faceConfigured && !faceWaitingForWake && faceAttempts < faceAttemptBudget) faceRetryTimer.restart()
    }
  
    function startFingerprint() {
-@@ -227,6 +287,42 @@
+@@ -463,6 +524,42 @@
      }
    }
  
@@ -476,7 +518,7 @@
    WlSessionLock {
      id: sessionLock
  
-@@ -238,7 +334,11 @@
+@@ -474,7 +571,11 @@
          root.pendingSessionLock = false
          sessionLockStabilizeTimer.stop()
          pendingSessionLockTimer.stop()
@@ -488,21 +530,22 @@
        }
      }
  
-@@ -270,7 +370,13 @@
-         anchors.fill: parent
+@@ -511,8 +612,14 @@
          backgroundPath: root.backgroundPath
+         videoPosterPath: root.videoPosterPath
          backgroundVersion: root.backgroundVersion
 +        unlockStyleDir: root.unlockStyleDir
 +        defaultLogoPath: root.defaultUnlockLogo
 +        styleBackground: root.unlockBackground
 +        styleText: root.unlockText
-         fingerprintConfigured: root.fingerprintConfigured
+         fingerprintConfigured: root.fingerprintConfigured || root.fingerprintUnavailable
+         fingerprintUnavailable: root.fingerprintUnavailable
 +        faceConfigured: root.faceConfigured
 +        faceAuthenticating: root.faceAuthenticating
          authenticatingPassword: root.authenticatingPassword
          failureMessage: root.failureMessage
          failedAttempts: root.failedAttempts
-@@ -280,7 +386,7 @@
+@@ -522,7 +629,7 @@
          onPasswordTextEdited: function(password) { root.enteredPassword = password }
          onSubmitPassword: function(password) { root.submitPassword(password) }
          onClearFailureRequested: root.failureMessage = ""
@@ -511,21 +554,22 @@
        }
  
      }
-@@ -300,7 +406,13 @@
-       anchors.fill: parent
+@@ -547,8 +654,14 @@
        backgroundPath: root.backgroundPath
+       videoPosterPath: root.videoPosterPath
        backgroundVersion: root.backgroundVersion
 +      unlockStyleDir: root.unlockStyleDir
 +      defaultLogoPath: root.defaultUnlockLogo
 +      styleBackground: root.unlockBackground
 +      styleText: root.unlockText
-       fingerprintConfigured: root.fingerprintConfigured
+       fingerprintConfigured: root.fingerprintConfigured || root.fingerprintUnavailable
+       fingerprintUnavailable: root.fingerprintUnavailable
 +      faceConfigured: root.faceConfigured
 +      faceAuthenticating: false
        authenticatingPassword: false
        failureMessage: ""
        failedAttempts: 0
-@@ -353,6 +465,21 @@
+@@ -630,6 +743,21 @@
      }
    }
  
@@ -546,8 +590,8 @@
 +
    Timer {
      id: fingerprintRetryTimer
-     interval: 250
-@@ -360,6 +487,41 @@
+     interval: FingerprintModel.MATCH_RETRY_MS
+@@ -637,6 +765,41 @@
      onTriggered: root.startFingerprint()
    }
  
@@ -586,10 +630,10 @@
 +    }
 +  }
 +
-   Process {
-     id: readlinkProc
-     command: ["readlink", "-f", root.currentBackgroundLink]
-@@ -387,6 +549,21 @@
+   // Detect resume both during an active attempt and during backoff.
+   Timer {
+     id: fingerprintSleepWatch
+@@ -739,6 +902,21 @@
    }
  
    Process {
@@ -609,9 +653,9 @@
 +
 +  Process {
      id: strandedLockCheckProc
-     command: ["bash", "-c", "omarchy-hyprland-session-locked"]
-     onExited: function(exitCode) {
-@@ -411,6 +588,36 @@
+     // $PPID is this shell: a crash re-execs in place, so its pid is the one to skip.
+     command: ["bash", "-c", "omarchy-hyprland-session-lock-stranded \"$PPID\""]
+@@ -764,6 +942,36 @@
      command: ["bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]
    }
  
@@ -647,25 +691,25 @@
 +
    Timer {
      id: idleBlankTimer
-     interval: 5000
-@@ -504,6 +711,7 @@
-   Component.onCompleted: {
+     readonly property int idleMs: 5000
+@@ -869,6 +1077,7 @@
+     knownScreenCount = realScreenCount()
      refreshBackground()
      refreshFingerprintStatus()
 +    refreshFaceStatus()
      checkStrandedLock()
    }
  
-@@ -530,6 +738,8 @@
+@@ -897,6 +1106,8 @@
          realScreens: root.realScreenCount(),
          passwordPam: root.passwordPamConfigured,
          fingerprint: root.fingerprintConfigured,
 +        face: root.faceConfigured,
 +        faceAttempts: root.faceAttempts,
+         fingerprintUnavailable: root.fingerprintUnavailable,
          authenticating: root.authenticating,
          lastEvent: root.lastEvent,
-         lastEventAt: root.lastEventAt
-@@ -539,6 +749,7 @@
+@@ -907,6 +1118,7 @@
      function preview(): string {
        root.refreshBackground()
        root.refreshFingerprintStatus()
