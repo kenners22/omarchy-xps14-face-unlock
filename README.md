@@ -18,7 +18,7 @@ Unlocks sudo, polkit (system prompts, 1Password) and the lock screen in about
 
 | | |
 |---|---|
-| Tested on | XPS 14 DA14260, Omarchy 4.0.4, kernel `7.2.5-3-omarchy` |
+| Tested on | XPS 14 DA14260, Omarchy 4.0.4, kernel `7.2.5-3-omarchy`; lock screen patch updated for Omarchy 4.5.0 |
 | IR stream | 648x368 @ ~29 fps on IPU7 CSI2 port 2; flood LED switched by the driver |
 | Sunlight | works: auto-exposure in the IR reader and the warm service (the sensor has none) |
 | Webcam | unaffected (Omarchy's relay at "Hardware ISP Camera") |
